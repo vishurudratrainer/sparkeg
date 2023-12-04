@@ -1,0 +1,141 @@
+BROADCAST join hint suggests Spark to use broadcast join regardless of configuration property autoBroadcastJoinThreshold. If both sides of the join have the broadcast hints, the one with the smaller size (based on stats) will be broadcast. The aliases for BROADCAST are BROADCASTJOIN and MAPJOIN.
+
+MERGE join hint suggests Spark to use shuffle sort merge join. Its aliases are SHUFFLE_MERGE and MERGEJOIN.
+
+SHUFFLE_HASH join hint suggests Spark to use shuffle hash join. If both sides have the shuffle hash hints, Spark chooses the smaller side (based on stats) as the build side.
+
+SHUFFLE_REPLICATE_NL join hint suggests Spark to use shuffle-and-replicate nested loop join.
+
+
+df1 = spark.createDataFrame([[1, 'A'], [2, 'B']], ['id', 'attr'])
+df1.createOrReplaceTempView("t1")
+df1.show()
+df2 = spark.createDataFrame([[1, 100], [2, 200], [3, 200]],
+                            ['id', 'int_attr'])
+df2.createOrReplaceTempView("t2")
+df2.show()
+
+df = df1.join(df2, on='id', how='inner')
+df.show()
+df.explain()
+
+
+df = df1.hint('broadcast').join(df2, on='id', how='inner')
+
+
+df = df1.hint('merge').join(df2, on='id', how='inner')
+
+
+df = df1.hint('SHUFFLE_HASH').join(df2, on='id', how='inner')
+
+
+df = spark.sql("SELECT /*+ BROADCAST(t1) */ * FROM t1 INNER JOIN t2 ON t1.id = t2.id;")
+
+
+-- Join Hints for broadcast join
+SELECT /*+ BROADCAST(t1) */ * FROM t1 INNER JOIN t2 ON t1.id = t2.id;
+SELECT /*+ BROADCASTJOIN (t1) */ * FROM t1 left JOIN t2 ON t1.id = t2.id;
+SELECT /*+ MAPJOIN(t2) */ * FROM t1 right JOIN t2 ON t1.id = t2.id;
+
+-- Join Hints for shuffle sort merge join
+SELECT /*+ SHUFFLE_MERGE(t1) */ * FROM t1 INNER JOIN t2 ON t1.id = t2.id;
+SELECT /*+ MERGEJOIN(t2) */ * FROM t1 INNER JOIN t2 ON t1.id = t2.id;
+SELECT /*+ MERGE(t1) */ * FROM t1 INNER JOIN t2 ON t1.id = t2.id;
+
+-- Join Hints for shuffle hash join
+SELECT /*+ SHUFFLE_HASH(t1) */ * FROM t1 INNER JOIN t2 ON t1.id = t2.id;
+
+-- Join Hints for shuffle-and-replicate nested loop join
+SELECT /*+ SHUFFLE_REPLICATE_NL(t1) */ * FROM t1 INNER JOIN t2 ON t1.id = t2.id;
+
+-- When different join strategy hints are specified on both sides of a join, Spark
+-- prioritizes the BROADCAST hint over the MERGE hint over the SHUFFLE_HASH hint
+-- over the SHUFFLE_REPLICATE_NL hint.
+-- Spark will issue Warning in the following example
+-- org.apache.spark.sql.catalyst.analysis.HintErrorLogger: Hint (strategy=merge)
+-- is overridden by another hint and will not take effect.
+SELECT /*+ BROADCAST(t1), MERGE(t1, t2) */ * FROM t1 INNER JOIN t2 ON t1.id = t2.id;
+
+Priority of join hints
+For the scenario that multiple different join hints are added for the same table, Spark follows the priority list below:
+
+BROADCAST
+MERGE
+SHUFFLE_HASH
+SHUFFLE_REPLACE_NL
+
+SortMerge join is a most scalable join in spark. We can force it by using merge hint.
+
+Shuffle Hash Join is a join where both dataframe are partitioned using same partitioner. Here join keys will fall in the same partitions.
+Cartesian Product is one type of join where two dataframe are joined using all rows.
+
+
+PySpark defines the pyspark.sql.functions.broadcast() to broadcast the smaller DataFrame which is then used to join the largest DataFrame
+
+We can provide the max size of DataFrame as a threshold for automatic broadcast join detection in PySpark. This can be set up by using autoBroadcastJoinThreshold configuration in SQL conf. Its value purely depends on the executor’s memory.
+
+
+#Enable broadcast Join and 
+#Set Threshold limit of size in bytes of a DataFrame to broadcast
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", 104857600)
+
+#Disable broadcast Join
+
+
+
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", -1)
+
+
+Joins are one of the fundamental operation when developing a spark job. So, it is worth knowing about the optimizations before working with joins.
+In Data Kare Solutions we often found ourselves in situations to joining two big tables (data frames) when dealing with Spark SQL. In this article we put out the best practices and optimization techniques we used to pursue when managing Spark Joins.
+
+Spark approaches two types of cluster communication Strategy:
+
+node-node communication strategy
+per-node communication strategy
+In node-node communication Spark shuffles the data across the clusters, whereas in per-node strategy spark perform broadcast joins.
+
+Performance of Spark joins depends upon the strategy used to tackle each scenario which in turn relies on the size of the tables. Sort Merge join and Shuffle Hash join are the two major power horses which drive the Spark SQL joins. Despite the fact that Broadcast joins are the most preferable and efficient one because it is based on per-node communication strategy which avoids shuffles but it’s applicable only for a smaller set of data. Thus, more often than not Spark SQL will go with both of Sort Merge join or Shuffle Hash.
+
+Sort -Merge Join
+Sort-Merge join is composed of 2 steps. The first step is to sort the datasets and the second operation is to merge the sorted data in the partition by iterating over the elements and according to the join key join the rows having the same value.
+
+From spark 2.3 Merge-Sort join is the default join algorithm in spark. However, this can be turned down by using the internal parameter ‘spark.sql.join.preferSortMergeJoin’ which by default is true.
+
+To accomplish ideal performance in Sort Merge Join:
+• Make sure the partitions have been co-located. Otherwise, there will be shuffle operations to co-locate the data as it has a pre-requirement that all rows having the same value for the join key should be stored in the same partition.
+• The DataFrame should be distributed uniformly on the joining columns.
+• To leverage parallelism the DataFrame should have an adequate number of unique keys
+
+Broadcast joins
+Easily Broadcast joins are the one which yield the maximum performance in spark. However, it is relevant only for little datasets. In broadcast join, the smaller table will be broadcasted to all worker nodes. Thus, when working with one large table and another smaller table always makes sure to broadcast the smaller table. We can hint spark to broadcast a table.
+
+import org.apache.spark.sql.functions.broadcast
+val dataframe = largedataframe.join(broadcast(smalldataframe), "key")
+Recently Spark has increased the maximum size for the broadcast table from 2GB to 8GB. Thus, it is not possible to broadcast tables which are greater than 8GB.
+
+Spark also internally maintains a threshold of the table size to automatically apply broadcast joins. The threshold can be configured using “spark.sql.autoBroadcastJoinThreshold” which is by default 10mb.
+So, it is wise to leverage Broadcast Joins whenever possible and Broadcast joins also solves uneven sharding and limited parallelism problems if the data frame is small enough to fit into the memory.
+
+Shuffle Hash Join
+Shuffle Hash join works based on the concept of map reduce. Map through the data frames and use the values of the join column as output key. Shuffles the data frames based on the output keys and join the data frames in the reduce phase as the rows from the different data frame with the same keys will ended up in the same machine.
+
+Spark chooses Shuffle Hash join when Sort merge join is turned off or if the key is not suitable and also based on the accompanying two functions.
+
+def canBuildLocalHashMap(plan:LogicalPlan):Boolean= { plan.statistics.sizeInBytes < conf.autoBroadcastJoinThreshold * conf.numShufflePartitions
+}
+As the name of the function indicates Spark uses this function to make sure Shuffle Hash join is better suitable for the given dataset than broadcast join. But, there might be a few situations where some scenarios join will be superior to anything Shuffle Hash join.
+
+So, at that point we may increase the automatic broadcast join threshold size (‘spark.sql.autoBroadcastJoinThreshold’) to trick the catalyst optimizer to use Broadcast join.
+
+def muchSmaller(a: LogicalPlan, b: LogicalPlan): Boolean = { a.statistics.sizeInBytes * 3 <= b.statistics.sizeInBytes
+}
+Creating hash tables are costly and it can be only done when the average size of a single partition is small enough to build a hash table.
+
+Sort merge join is a very good candidate in most of times as it can spill the data to the disk and doesn’t need to hold the data in memory like its counterpart Shuffle Hash join. However, when the build size is smaller than the stream size Shuffle Hash join will outperform Sort Merge join.
+
+The factors which decide the performance in the Shuffle Hash Join is same as the one in the Sort Merge Join, except it doesn’t necessarily need the partitions should be co-located.
+
+The DataFrame should be distributed evenly on the joining columns.
+To leverage parallelism the DataFrame should have an adequate number of unique keys.
+Tips: During joins if there are rows which are irrelevant to the key, filter the rows before the join. Otherwise, there will be more data shuffle over the network.
