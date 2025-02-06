@@ -1,0 +1,48 @@
+Unlike traditional static query plans, AQE enables Spark to adjust query plans during execution. It collects runtime statistics (like data sizes, skew, and partitioning information) and uses these insights to optimize the query. This adaptive optimization leads to improved performance in scenarios where the data distribution isn't known beforehand or when dealing with complex transformations and joins.
+
+Here are some key features of Adaptive Query Execution (AQE)
+
+Adaptive Query Execution can adjust the join strategy at runtime based on the actual size of the datasets involved. For instance, if a table turns out to be small enough during execution, AQE can switch from a sort-merge join to a more efficient broadcast join, reducing shuffle overhead.
+Adaptive Query Execution can dynamically coalesce partitions (combine small partitions into reasonably sized partitions) after shuffle exchange. Very small tasks have worse I/O throughput and tend to suffer more from scheduling overhead and task setup overhead. Combining small tasks saves resources and improves cluster throughput.
+Adaptive Query Execution can dynamically handle skew in sort-merge join and shuffle hash join by splitting (and replicating if needed) skewed tasks into roughly evenly sized tasks.
+Adaptive Query Execution can dynamically detect and propagate empty relations.
+How to enable and configure AQE?
+Adaptive Query Execution is enabled by default in Spark 3.0 and later. You can verify or change its status using:
+
+# Verify AQE status
+spark.conf.get("spark.sql.adaptive.enabled")
+
+# Enable AQE if not already enabled
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+
+
+1) Broadcast Join Threshold: Specifies the maximum size of a table to be broadcasted for a join. AQE adjusts the join strategy based on this value.
+
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "10m")
+Apache Spark Performance Tuning
+
+2) Post-Shuffle Partition Coalescing: Controls whether Spark should combine small partitions after a shuffle.
+
+spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
+Apache Spark Performance Tuning
+
+3) Advisory Partition Size: Sets the target size (in bytes) for shuffle partitions after coalescing. Adjusting this can help balance between I/O performance and parallelism.
+
+spark.conf.set("spark.sql.adaptive.advisoryPartitionSizeInBytes", "64m")
+Apache Spark Performance Tuning
+
+4) Skew Join Optimization: Enables AQE to handle data skew during joins by splitting large skewed partitions.
+
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+Apache Spark Performance Tuning
+
+5)
+Spark uses the spark.sql.autoBroadcastJoinThreshold configuration to determine the maximum size of a table that will be automatically broadcast. In Spark 3.0 and later, the default is 10MB. You can adjust this:
+
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "100m")
+When to Use Broadcast Joins
+Broadcast joins are most effective when:
+https://github.com/ankurchavda/SparkLearning/blob/master/advanced/optimizations.md
+https://github.com/umbertogriffo/apache-spark-best-practices-and-tuning/tree/master
+Broadcast joins are typically used when one dataset is small enough to fit in the memory of each executor node. While the threshold varies depending on cluster configuration, datasets of up to a few hundred megabytes are generally considered appropriate for broadcasting.
+Broadcast joins work best for equi-joins, where the join is performed based on equality conditions (ON a.col = b.col). They are not well-suited for complex join conditions, such as range-based joins.

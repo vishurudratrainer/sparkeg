@@ -4,7 +4,13 @@ Created on Thu Dec  9 22:29:35 2021
 
 @author: ASUS
 What is PySpark Accumulator?
-Accumulators are write-only and initialize once variables where only tasks that are running on workers are allowed to update and updates from the workers get propagated automatically to the driver program. But, only the driver program is allowed to access the Accumulator variable using the value property.
+Accumulators are write-only and initialize once variables 
+where only tasks that are running on workers 
+are allowed to update and 
+updates from the workers get propagated
+ automatically to the driver program. 
+ But, only the driver program is allowed to access 
+ the Accumulator variable using the value property.
 
 How to create Accumulator variable in PySpark?
 Using accumulator() from SparkContext class we can create an Accumulator in PySpark programming. Users can also create Accumulators for custom types using AccumulatorParam class of PySpark.

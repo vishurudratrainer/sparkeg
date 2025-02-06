@@ -1,0 +1,8 @@
+5. Tungsten Execution:
+Tungsten is Spark's secret weapon for optimizing execution plans and memory management. It's like having a turbo boost for your computations, improving CPU and memory efficiency.
+
+--conf spark.sql.execution.arrow.pyspark.enabled=true
+
+Tired of over-provisioning your cluster? Dynamic Resource Allocation adjusts the number of executors based on workload, optimizing resource usage and reducing costs by up to 50%.
+
+--conf spark.dynamicAllocation.enabled=true
