@@ -1,0 +1,123 @@
+Yes, **Window functions (`Window.partitionBy`, `rank`, `dense_rank`, `lead`, `lag`)** are explicitly covered in **Module 10** of our 34-module curriculum map.
+
+Regarding **Try-Except in PySpark**, robust error handling is typically applied at the driver script level, or managed via PySpark's built-in corrupt record handling (`PERMISSIVE` mode) for ETL pipelines.
+
+Below are dedicated code examples for both **Advanced Window Functions (`dense_rank`, `lead`, `lag`)** and **Try-Except Error Handling Patterns** in PySpark:
+
+---
+
+### 1. Window Functions: `dense_rank`, `lead`, & `lag` Example
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.window import Window
+import pyspark.sql.functions as F
+
+spark = SparkSession.builder.appName("Window_Advanced_Demo").getOrCreate()
+
+# Sample Dataset: Employee salaries by department
+data = [
+    ("Engineering", 100000), 
+    ("Engineering", 120000), 
+    ("Engineering", 120000),  # Duplicate salary to show dense_rank vs rank
+    ("Engineering", 90000),
+    ("Sales", 80000), 
+    ("Sales", 95000), 
+    ("Sales", 95000), 
+    ("Sales", 60000)
+]
+df = spark.createDataFrame(data, ["department", "salary"])
+
+# Define Window Specification partitioned by department, ordered by salary descending
+window_spec = Window.partitionBy("department").orderBy(F.col("salary").desc())
+
+df_windowed = df.withColumn("rank", F.rank().over(window_spec)) \
+                .withColumn("dense_rank", F.dense_rank().over(window_spec)) \
+                .withColumn("next_higher_salary", F.lead("salary", 1).over(window_spec)) \
+                .withColumn("prev_lower_salary", F.lag("salary", 1).over(window_spec))
+
+df_windowed.show(truncate=False)
+spark.stop()
+
+```
+
+#### **Explanation of Window Functions:**
+
+* **`dense_rank()` vs `rank()`:** `rank()` leaves gaps in ranking numbers when there are ties (e.g., 1, 2, 2, 4), whereas `dense_rank()` assigns consecutive numbers without gaps (e.g., 1, 2, 2, 3).
+* **`lead(col, offset)`:** Looks *forward* in the window partition by a given offset (e.g., fetching the salary of the person immediately below in ranking).
+* **`lag(col, offset)`:** Looks *backward* in the window partition by a given offset (e.g., fetching the salary of the person immediately above in ranking).
+
+---
+
+### 2. Try-Except Error Handling Patterns in PySpark
+
+Because transformations are lazy and execute across distributed worker nodes, standard Python `try...except` blocks on worker code (like inside UDFs) will fail or swallow errors silently. Proper error handling focuses on **Driver-side job execution** and **Data-level corruption handling**.
+
+#### **Pattern A: Driver-Side Job Execution Guard (`try...except`)**
+
+Use standard Python try-except blocks around actions (`count`, `collect`, `write`) on the driver to catch cluster connectivity drops, missing files, or out-of-memory crashes:
+
+```python
+from pyspark.sql import SparkSession
+import sys
+
+spark = SparkSession.builder.appName("TryExcept_Driver_Demo").getOrCreate()
+
+try:
+    print("Attempting to read and process dataset...")
+    # Intentionally pointing to a non-existent path to trigger an exception
+    df = spark.read.parquet("/data/lake/non_existent_path.parquet")
+    row_count = df.count()
+    print(f"Successfully processed {row_count} rows.")
+
+except Exception as e:
+    print(f"[ERROR] PySpark job execution failed on driver: {str(e)}", file=sys.stderr)
+    # Perform cleanup or fallback logic here
+    sys.exit(1)
+
+finally:
+    print("Stopping Spark Session cleanly.")
+    spark.stop()
+
+```
+
+#### **Pattern B: Handling Bad/Corrupt Records (Data-Level Error Handling)**
+
+When parsing JSON or CSV data with malformed rows, wrapping everything in a `try-except` will crash the job. Instead, use Spark's built-in **`PERMISSIVE` mode** and a `_corrupt_record` column to isolate bad data gracefully:
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, IntegerType, StringType
+
+spark = SparkSession.builder.appName("Corrupt_Record_Handling").getOrCreate()
+
+# Define explicit schema including a column for bad/corrupt payloads
+schema = StructType([
+    StructField("id", IntegerType(), True),
+    StructField("name", StringType(), True),
+    StructField("_corrupt_record", StringType(), True) # Captures lines that fail schema validation
+])
+
+# Sample malformed JSON strings
+json_data = [
+    '{"id": 1, "name": "Alice"}',
+    '{"id": "invalid_int", "name": "Bob"}', # Will be routed to _corrupt_record
+    '{"id": 3, "name": "Charlie"}'
+]
+rdf = spark.sparkContext.parallelize(json_data)
+
+# Read with PERMISSIVE mode enabled
+df_cleaned = spark.read.option("mode", "PERMISSIVE") \
+                       .option("columnNameOfCorruptRecord", "_corrupt_record") \
+                       .schema(schema) \
+                       .json(rdf)
+
+print("--- Successfully Parsed Valid Records ---")
+df_cleaned.filter("_corrupt_record IS NULL").select("id", "name").show()
+
+print("--- Quarantined Corrupt Records ---")
+df_cleaned.filter("_corrupt_record IS NOT NULL").select("_corrupt_record").show(truncate=False)
+
+spark.stop()
+
+```

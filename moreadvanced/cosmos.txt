@@ -1,0 +1,216 @@
+Here is a comprehensive masterclass guide with production-ready PySpark code examples for **ADLS Gen2 Connection**, **Cosmos DB Integration**, and **Azure Synapse Spark Pools**.
+
+---
+
+## 1. Connecting to ADLS Gen2 (Azure Data Lake Storage Gen2)
+
+PySpark can connect to ADLS Gen2 using either standard ABFS (`abfss://`) protocols via **Service Principal OAuth 2.0** (recommended for enterprise security) or **Storage Account Access Keys**.
+
+### Method A: Service Principal Authentication (OAuth 2.0 - Recommended)
+
+```python
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("ADLS_Gen2_OAuth").getOrCreate()
+
+# Storage Account details
+storage_account_name = "your_storage_account_name"
+container_name = "your_container_name"
+client_id = "YOUR_AZURE_CLIENT_ID"
+client_secret = "YOUR_AZURE_CLIENT_SECRET"
+tenant_id = "YOUR_AZURE_TENANT_ID"
+
+# Spark Hadoop Configuration for ABFS Driver
+spark.conf.set(f"fs.azure.account.auth.type.{storage_account_name}.dfs.core.windows.net", "OAuth")
+spark.conf.set(f"fs.azure.account.oauth.provider.type.{storage_account_name}.dfs.core.windows.net", "org.apache.hadoop.fs.azureblob.oauth2.ClientCredsTokenProvider")
+spark.conf.set(f"fs.azure.account.oauth2.client.id.{storage_account_name}.dfs.core.windows.net", client_id)
+spark.conf.set(f"fs.azure.account.oauth2.client.secret.{storage_account_name}.dfs.core.windows.net", client_secret)
+spark.conf.set(f"fs.azure.account.oauth2.client.endpoint.{storage_account_name}.dfs.core.windows.net", f"https://login.microsoftonline.com/{tenant_id}/oauth2/token")
+
+# Construct ADLS Gen2 Path
+adls_path = f"abfss://{container_name}@{storage_account_name}.dfs.core.windows.net/data/sales_2026.parquet"
+
+# --- Reading Parquet from ADLS Gen2 ---
+df = spark.read.parquet(adls_path)
+df.show(5)
+
+# --- Writing Parquet to ADLS Gen2 with Partitioning ---
+output_path = f"abfss://{container_name}@{storage_account_name}.dfs.core.windows.net/processed/sales_by_region"
+df.write \
+  .mode("overwrite") \
+  .partitionBy("region") \
+  .parquet(output_path)
+
+```
+
+---
+
+### Method B: Storage Account Access Key
+
+```python
+storage_account_name = "your_storage_account_name"
+storage_account_key = "YOUR_STORAGE_ACCOUNT_ACCESS_KEY"
+
+# Configure Key Authentication
+spark.conf.set(
+    f"fs.azure.account.key.{storage_account_name}.dfs.core.windows.net",
+    storage_account_key
+)
+
+adls_path = f"abfss://container@{storage_account_name}.dfs.core.windows.net/raw_data.csv"
+df_csv = spark.read.option("header", "true").csv(adls_path)
+
+```
+
+---
+
+## 2. Reading & Writing Azure Cosmos DB (OLTP & Analytical Store / Synapse Link)
+
+To connect PySpark with Cosmos DB, use the official **`azure-cosmos-spark`** OLTP connector (using the SQL API) or **Synapse Link** (for analytical workloads without consuming Request Units).
+
+### A. Reading & Writing via Cosmos DB OLTP Connector (`spark-cosmos`)
+
+#### **Reading from Cosmos DB**
+
+```python
+# Configure connection parameters
+cosmos_endpoint = "https://your-cosmos-account.documents.azure.com:443/"
+cosmos_master_key = "YOUR_COSMOS_PRIMARY_KEY"
+cosmos_database = "SalesDatabase"
+cosmos_container = "OrdersContainer"
+
+cfg = {
+  "spark.cosmos.accountEndpoint": cosmos_endpoint,
+  "spark.cosmos.accountKey": cosmos_master_key,
+  "spark.cosmos.database": cosmos_database,
+  "spark.cosmos.container": cosmos_container,
+  "spark.cosmos.read.inferSchema.enabled": "true"
+}
+
+# Read Cosmos DB JSON Documents into PySpark DataFrame
+cosmos_df = spark.read.format("cosmos.oltp").options(**cfg).load()
+cosmos_df.filter("amount > 100").show(5)
+
+```
+
+#### **Writing to Cosmos DB**
+
+```python
+import pyspark.sql.functions as F
+
+# Sample data generation
+data = [("ORD_1001", "CUST_501", 250.75, "COMPLETED"),
+        ("ORD_1002", "CUST_502", 99.00, "PENDING")]
+columns = ["id", "customer_id", "amount", "status"]
+
+new_orders_df = spark.createDataFrame(data, columns)
+
+# Write modes: Append, Upsert (overwrite existing partition keys)
+write_cfg = {
+  "spark.cosmos.accountEndpoint": cosmos_endpoint,
+  "spark.cosmos.accountKey": cosmos_master_key,
+  "spark.cosmos.database": cosmos_database,
+  "spark.cosmos.container": cosmos_container,
+  "spark.cosmos.write.strategy": "ItemOverwrite"  # Upsert behavior
+}
+
+new_orders_df.write \
+  .format("cosmos.oltp") \
+  .options(**write_cfg) \
+  .mode("append") \
+  .save()
+
+```
+
+---
+
+### B. Reading via Cosmos DB Analytical Store (Azure Synapse Link)
+
+If Azure Synapse Link is enabled on your container, you can query Cosmos DB without impacting operational RU/s:
+
+```python
+# Query Cosmos DB Analytical Store (No RU consumption)
+synapse_link_df = spark.read \
+    .format("cosmos.oltp") \
+    .option("spark.cosmos.accountEndpoint", cosmos_endpoint) \
+    .option("spark.cosmos.accountKey", cosmos_master_key) \
+    .option("spark.cosmos.database", cosmos_database) \
+    .option("spark.cosmos.container", cosmos_container) \
+    .option("spark.cosmos.useAnalyticalStore", "true") \
+    .load()
+
+synapse_link_df.printSchema()
+
+```
+
+---
+
+## 3. Azure Synapse Spark Pools
+
+Azure Synapse Analytics provides pre-configured, managed Spark Pools. Key features include **Linked Services Integration**, **Synapse Dedicated SQL Pool Connectors (PolyBase/COPY)**, and **Key Vault Integration**.
+
+### A. Reading & Writing Synapse Dedicated SQL Pools (Data Warehouse)
+
+Synapse Spark Pools feature a high-speed native connector (`pyspark.sql.sqlanalytics`) to push data into or extract data from Synapse Dedicated SQL Pools via ADLS Gen2 staging:
+
+```python
+# 1. Setup ADLS Gen2 Staging Directory for Synapse High-Performance COPY/PolyBase
+server_name = "your-synapse-workspace.sql.azuresynapse.net"
+database_name = "DedicatedSQLPool1"
+table_name = "dbo.FactSales"
+temp_folder = "abfss://stage@yourstorage.dfs.core.windows.net/synapse_staging"
+
+# 2. Reading from Dedicated SQL Pool into Spark
+df_sql_pool = spark.read \
+    .option("Constants.SERVER", server_name) \
+    .option("Constants.DATABASE", database_name) \
+    .option("Constants.TEMP_FOLDER", temp_folder) \
+    .synapsesql(f"{database_name}.{table_name}")
+
+df_sql_pool.show(5)
+
+# 3. Writing DataFrame back to Dedicated SQL Pool (High Performance Bulk Load)
+df_transformed = df_sql_pool.filter("amount > 50")
+
+df_transformed.write \
+    .option("Constants.SERVER", server_name) \
+    .option("Constants.DATABASE", database_name) \
+    .option("Constants.TEMP_FOLDER", temp_folder) \
+    .mode("overwrite") \
+    .synapsesql(f"{database_name}.dbo.FactSales_Filtered")
+
+```
+
+---
+
+### B. Secure Secrets Retrieval via Azure Key Vault in Synapse
+
+In Synapse Spark Pools, avoid hardcoding secrets. Use `mssparkutils.credentials` to fetch secrets directly from Azure Key Vault:
+
+```python
+from notebookutils import mssparkutils
+
+# Fetch secrets securely from Azure Key Vault linked service
+key_vault_name = "kv-enterprise-prod"
+client_secret = mssparkutils.credentials.getSecret(key_vault_name, "adls-app-secret")
+cosmos_key = mssparkutils.credentials.getSecret(key_vault_name, "cosmos-primary-key")
+
+# Pass retrieved secret directly into Spark configurations
+spark.conf.set("fs.azure.account.oauth2.client.secret.youraccount.dfs.core.windows.net", client_secret)
+
+```
+
+---
+
+### C. Reading ADLS Gen2 via Synapse Linked Services (Zero Credentials)
+
+When running inside a Synapse Spark Pool, if ADLS Gen2 is attached as a Linked Service, credentials are handled automatically using Managed Identity (MSI):
+
+```python
+# Direct access without credential setup (Uses Synapse Workspace Managed Identity)
+linked_adls_path = "abfss://rawdata@synapsedatalake.dfs.core.windows.net/logs/2026/*.json"
+
+df_logs = spark.read.json(linked_adls_path)
+df_logs.groupBy("level").count().show()
+
+```
