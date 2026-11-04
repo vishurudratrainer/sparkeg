@@ -1,0 +1,970 @@
+Here is the complete, high-performance architecture rewritten entirely using **Pure Spark SQL (`spark.sql()`)**, incorporating advanced enterprise optimizations tailored for massive HFT market data scale (10.5+ crore records).
+
+---
+
+### Key Optimizations Added in the Pure SQL Version
+
+1. **Trade Expansion via SQL `sequence()` & `explode()`:** Dynamically generates minute-by-minute time buckets between `st` and `end` directly inside SQL without writing custom UDFs.
+2. **Broadcast Join Hint (`/*+ BROADCAST(t) */`):** Assuming the trade dataset is significantly smaller than the 10.5-crore market tick table, broadcasting the trade side completely eliminates the heavy shuffle exchange on the massive tick table.
+3. **`min_by` for First Price:** Instead of an expensive Window ranking function (`ROW_NUMBER()` or `FIRST_VALUE`), we use `MIN_BY(price, market_timestamp)`, which natively evaluates the price associated with the earliest millisecond tick in a single aggregate pass.
+
+---
+
+### Complete PySpark SQL Implementation
+
+```python
+from pyspark.sql import SparkSession
+
+# 1. Initialize Spark Session with Delta / Catalyst configurations
+spark = SparkSession.builder \
+    .appName("HFTMarketDataSQLMasterclass") \
+    .master("local[*]") \
+    .getOrCreate()
+
+# --- SIMULATED DATA SETUP ---
+market_data = spark.createDataFrame([
+    ("2026-11-03", "A", "2026-11-03 09:00:05.100", 150.5),
+    ("2026-11-03", "A", "2026-11-03 09:00:12.500", 151.0),
+    ("2026-11-03", "A", "2026-11-03 09:05:02.000", 149.8),
+], ["date", "sym", "market_timestamp", "price"])
+market_data.createOrReplaceTempView("market_data")
+
+trade_data = spark.createDataFrame([
+    ("Trd_1", "2026-11-03", "A", "2026-11-03 09:00:00", "2026-11-03 09:10:00"),
+    ("Trd_2", "2026-11-03", "A", "2026-11-03 09:05:00", "2026-11-03 09:15:00"),
+], ["trade_id", "date", "sym", "st", "end"])
+trade_data.createOrReplaceTempView("trade_data")
+
+
+# --- STEP 1: EXPAND TRADE TIME INTERVALS INTO MINUTE BUCKETS ---
+# Uses Spark SQL sequence() and explode() to map trades across minute slices
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW expanded_trades AS
+    SELECT 
+        trade_id,
+        date,
+        sym,
+        st,
+        end,
+        date_format(bucket_ts, 'yyyy-MM-dd HH:mm') AS time_bucket
+    FROM trade_data
+    LATERAL VIEW explode(
+        sequence(
+            date_trunc('minute', CAST(st AS TIMESTAMP)), 
+            date_trunc('minute', CAST(end AS TIMESTAMP)), 
+            INTERVAL 1 MINUTE
+        )
+    ) AS bucket_ts
+""")
+
+
+# --- STEP 2: BIN MARKET TICKS & APPLY SELECTIVE SALTING ---
+# Skewed symbols ('A', 'B') are salted across 4 virtual buckets to distribute join load
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW binned_salted_market AS
+    SELECT 
+        date,
+        sym,
+        market_timestamp,
+        price,
+        date_format(CAST(market_timestamp AS TIMESTAMP), 'yyyy-MM-dd HH:mm') AS time_bucket,
+        CASE 
+            WHEN sym IN ('A', 'B') THEN ABS(hash(market_timestamp) % 4)
+            ELSE 0 
+        END AS salt_key
+    FROM market_data
+""")
+
+
+# --- STEP 3: APPLY CORRESPONDING SALTING TO TRADES ---
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW binned_salted_trades AS
+    SELECT 
+        trade_id,
+        date,
+        sym,
+        st,
+        end,
+        time_bucket,
+        CASE 
+            WHEN sym IN ('A', 'B') THEN ABS(hash(trade_id) % 4)
+            ELSE 0 
+        END AS salt_key
+    FROM expanded_trades
+""")
+
+
+# --- STEP 4: OPTIMIZED EQUI-JOIN WITH BROADCAST HINT ---
+# Broadcasts trades to workers, avoiding 10.5 crore tick table shuffle
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW joined_market_trades AS
+    SELECT /*+ BROADCAST(t) */
+        t.trade_id,
+        t.sym,
+        t.st,
+        t.end,
+        m.market_timestamp,
+        m.price
+    FROM binned_salted_trades t
+    INNER JOIN binned_salted_market m
+      ON t.date = m.date 
+      AND t.sym = m.sym 
+      AND t.time_bucket = m.time_bucket 
+      AND t.salt_key = m.salt_key
+    WHERE m.market_timestamp >= t.st 
+      AND m.market_timestamp <= t.end
+""")
+
+
+# --- STEP 5: FINAL METRIC AGGREGATION VIA SPARK SQL ---
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW hft_trade_metrics AS
+    SELECT 
+        trade_id,
+        sym,
+        st,
+        end,
+        -- Market Data Availability / Total Tick Count
+        COUNT(market_timestamp) AS total_tick_count,
+        
+        -- Min & Max Price
+        MIN(price) AS min_price,
+        MAX(price) AS max_price,
+        
+        -- Timestamps of Min & Max Price
+        MIN_BY(market_timestamp, price) AS timestamp_of_min_price,
+        MAX_BY(market_timestamp, price) AS timestamp_of_max_price,
+        
+        -- First Price within range (Price where market_timestamp is minimum)
+        MIN_BY(price, market_timestamp) AS first_price
+    FROM joined_market_trades
+    GROUP BY trade_id, sym, st, end
+""")
+
+# Display Final Results
+print("=== OPTIMIZED HFT SQL METRICS RESULTS ===")
+spark.sql("SELECT * FROM hft_trade_metrics").show(truncate=False)
+
+spark.stop()
+
+```
+
+To be completely transparent, the number **`4`** in `ABS(hash(...) % 4)` was used as a **placeholder/example value** in the code snippet.
+
+In a production HFT pipeline handling **10.5+ crore records** with heavy symbol skew, hardcoding `4` is dangerous—if symbol 'A' accounts for 40% of your total volume, dividing it into just 4 buckets will still dump ~1 crore rows into each bucket, potentially triggering executor OOMs.
+
+The optimal number of salt buckets (`N`) should be determined systematically using the following engineering formula:
+
+---
+
+### How to Calculate the Salt Factor (`N`) in Production
+
+#### 1. Measure the Hot-Key Volume per Time Window
+
+Determine how many records the heaviest skewed symbol (`sym`) generates within your binning window (e.g., a 1-minute bucket).
+
+* *Example:* Symbol 'A' generates **3,000,000 records** in a single 1-minute bucket.
+
+#### 2. Target an Ideal Spark Partition Size
+
+Spark tasks perform best when partition sizes range between **100 MB to 200 MB** (or roughly 1 million to 2 million rows, depending on row width). Let's target a maximum of **500,000 rows per salted partition** to keep memory pressure low and maximize parallelism.
+
+#### 3. Calculate `N` Dynamically
+
+$$\text{Salt Buckets } (N) = \frac{\text{Volume of Heaviest Key in Bucket}}{\text{Target Rows per Partition}}$$
+
+Using our example:
+
+
+$$N = \frac{3,000,000}{500,000} = 6$$
+
+
+So, you would use **6** (or round up to a power of 2 like **8**) for your salt factor.
+
+---
+
+### Production Implementation: Dynamic Salting
+
+Instead of a hardcoded modulo, enterprise pipelines often derive `N` based on cluster capacity or configuration properties:
+
+```sql
+-- Example: Using a configuration parameter or dynamic calculation 
+-- rather than a hardcoded number like 4
+CREATE OR REPLACE TEMPORARY VIEW binned_salted_market AS
+SELECT 
+    date,
+    sym,
+    market_timestamp,
+    price,
+    date_format(CAST(market_timestamp AS TIMESTAMP), 'yyyy-MM-dd HH:mm') AS time_bucket,
+    CASE 
+        -- Configurable salt factor '8' driven by pipeline metadata
+        WHEN sym IN ('A', 'B') THEN ABS(hash(market_timestamp) % 8)
+        ELSE 0 
+    END AS salt_key
+FROM market_data
+
+```
+
+### Rule of Thumb for Choosing `N`
+
+* **Too small (e.g., 2 or 4):** The skewed partitions remain too large, causing straggler tasks and memory overflow on heavy nodes.
+* **Too large (e.g., 100+):** You create a "small file" or "too many tasks" problem, where the Spark scheduler spends more time managing task overhead than executing data processing.
+* **Sweet Spot:** Usually between **8 to 32**, depending on your cluster's total core count and the volume disparity between cold and hot keys.
+
+
+Cluster cores dictate **concurrent task execution capacity**. When you introduce salting to handle skewed keys (like symbol 'A' with millions of records), your cluster cores determine how efficiently those salted partitions are processed across the cluster.
+
+---
+
+### The Core Principle: Partitions vs. Available Cores
+
+Spark executes work in units called **tasks**, with each executor core processing one task at a time. If your salt factor ($N$) and total partition count do not align with your cluster's core capacity, you run into two major bottlenecks:
+
+#### 1. Under-utilization (Salt Count < Total Cores)
+
+If your cluster has **64 total executor cores**, but your salt factor for a skewed symbol is set to `4`, then when that symbol is joined, **only 4 tasks will be active**.
+
+* The remaining **60 cores on your cluster will sit completely idle** waiting for those 4 heavy tasks to finish.
+* This turns a distributed cluster into a single-threaded bottleneck, defeating the purpose of scaling.
+
+#### 2. Over-saturation / Task Overhead (Salt Count >>> Total Cores)
+
+If you set the salt factor to `1000` for a small dataset, Spark has to schedule, track, and serialize 1,000 discrete tasks. The driver spends more time managing task metadata overhead than executing actual data logic.
+
+---
+
+### The Golden Rule: The Concurrency Multiplier
+
+To maximize cluster core utilization without incurring scheduling overhead, your total partition count (base partitions + salt buckets) should ideally be **2 to 3 times your total available executor cores**.
+
+$$\text{Target Total Partitions} = \text{Total Cluster Cores} \times K \quad (K = 2 \text{ to } 3)$$
+
+#### How to Calculate Salt Factor ($N$) Based on Cores:
+
+1. **Count Total Cores:** Suppose your cluster has 8 worker nodes with 8 cores each = **64 total executor cores**.
+2. **Determine Target Partitions:** For optimal CPU pipelining, you want around $64 \times 3 = \mathbf{192 \text{ partitions}}$ in your join stage.
+3. **Derive Salt Factor:** If your normal unskewed data naturally splits into 150 partitions, setting your salt factor ($N$) for heavy symbols to **8 or 16** pushes your total join partitions right into that sweet spot of ~192, ensuring all 64 cores stay 100% saturated.
+
+---
+
+### What Happens at the Worker Level During a Skewed Join
+
+When you apply `ABS(hash(...) % N)` with a core-aligned salt factor:
+
+1. **Breaking the Monolith:** A massive 3-million-row partition for symbol 'A' is broken down into $N$ smaller, independent chunks distributed across different worker nodes.
+2. **Core Saturation:** Instead of 1 core processing 3 million rows (and likely throwing an OOM error), **$N$ distinct cores** pick up the $N$ salt slices concurrently.
+3. **No Stragglers:** Because each salt slice is roughly equal in size, all tasks finish around the same time, preventing a single "straggler task" from holding up the entire Spark stage barrier.
+
+
+Here is a detailed breakdown of the core logic and architectural optimizations implemented to handle 10.5+ crore high-frequency trading (HFT) market ticks joined against overlapping trade intervals.
+
+---
+
+### Phase 1: Eliminating the Cartesian Cross-Join
+
+**The Naive Problem:**
+A naive interval join (`ON market_timestamp BETWEEN st AND end`) forces Spark to evaluate every single market tick against every trade window globally. For 10.5+ crore records, this causes a catastrophic **Cartesian product explosion**, blowing out executor memory and bringing the cluster to a halt.
+
+**The Optimization (Time-Bucket Binning & Expansion):**
+
+1. **Discretizing Time:** We downsample continuous millisecond streams into discrete coarse-grained boundaries—specifically **1-minute time buckets** (`yyyy-MM-dd HH:mm`).
+2. **Trade Range Expansion:** Instead of matching continuous ranges directly, we take each trade’s start (`st`) and end (`end`) timestamps and generate an array of every minute it spans using Spark SQL’s `sequence()` function. We then `explode()` that array into individual rows.
+3. **The Result:** A trade lasting from `09:00:15` to `09:12:45` is expanded into 13 discrete minute rows. Market ticks are similarly bucketed by their minute. The join condition is restricted strictly to matching minute buckets, reducing the search space from a global cross-join to localized micro-intervals.
+
+---
+
+### Phase 2: Neutralizing Heavy Symbol Skew
+
+**The Naive Problem:**
+In HFT datasets, a few symbols (e.g., symbol 'A') account for 90% of trading volume. Standard partitioning by `sym` sends all records for symbol 'A' to a single executor node, causing an inevitable **skew bottleneck / OOM error** while all other executors sit idle.
+
+**The Optimization (Core-Aligned Selective Salting):**
+
+1. **Targeted Salting:** Instead of salting every row (which creates unnecessary shuffle overhead for cold, low-volume symbols), we apply a conditional check: only known heavy symbols (`sym IN ('A', 'B')`) receive a salt key.
+2. **Virtual Sub-Partitioning:** We hash a unique row-level identifier (like `market_timestamp` or `trade_id`) and use a modulo operation (`ABS(hash(...) % N}`) to distribute the heavy key across $N$ virtual buckets.
+3. **Core-Aware Sizing:** As discussed earlier, $N$ is chosen mathematically to align with total cluster core capacity, ensuring the massive symbol volume is evenly shredded across multiple worker cores concurrently without creating stragglers.
+
+---
+
+### Phase 3: Optimizing the Join Topology via Broadcasts
+
+**The Naive Problem:**
+Joining two large distributed datasets forces Spark to execute a **Shuffle Hash Join** or **Sort Merge Join**, moving tens of gigabytes of data across the network.
+
+**The Optimization (Broadcast Equi-Join):**
+
+1. **Equi-Join Transformation:** Because we successfully reduced interval matching down to exact equality matches (`date`, `sym`, `time_bucket`, and `salt_key`), Spark no longer needs complex inequality join algorithms. It becomes a clean, multi-column **equi-join**.
+2. **Broadcast Hint (`/*+ BROADCAST(t) */`):** Assuming the exploded trade table is significantly smaller than the 10.5-crore market tick table, we explicitly instruct Catalyst to broadcast the trade side.
+3. **The Result:** The entire exploded trade dataset is copied to every worker node's memory. Spark can stream the 10.5 crore market ticks locally against the broadcasted trades **with zero network shuffle on the massive tick table**.
+
+---
+
+### Phase 4: Post-Join Precise Filtering & Single-Pass Aggregations
+
+**The Naive Problem:**
+Because we bucketed data by minute, a trade starting at `09:00:50` might share the `09:00` minute bucket with market ticks starting at `09:00:00`. A naive bucket join would pick up those 50 seconds of out-of-range data. Furthermore, calculating metrics like "First Price" or "Timestamp of Min Price" usually requires expensive Window ranking functions (`ROW_NUMBER() OVER (...)`).
+
+**The Optimization (Precision Filtering & `min_by`/`max_by`):**
+
+1. **Post-Join Boundary Check:** Immediately after the bucket join, we enforce the strict millisecond boundaries:
+
+$$\text{WHERE market\_timestamp} \ge \text{st AND market\_timestamp} \le \text{end}$$
+
+
+
+This trims any edge-case ticks that fell into the shared minute bucket but sat outside the exact trade window.
+2. **Replacing Window Functions with Aggregators:** Instead of sorting partitions using heavy window functions to find the first price or minimum price timestamps, we use native SQL aggregate functions:
+* **`MIN_BY(price, market_timestamp)`:** Directly evaluates and returns the price associated with the *earliest* timestamp in a single aggregation pass.
+* **`MIN_BY(market_timestamp, price)` / `MAX_BY(market_timestamp, price)`:** Instantly extracts the exact millisecond timestamp where the minimum or maximum price occurred without needing secondary self-joins.
+
+
+You are completely right to call that out. If the trade table is also massive—and especially after being exploded across minute intervals—attempting to `BROADCAST` it will instantly crash the driver or executors with an **`OutOfMemoryError`**.
+
+When **both sides of the join are massive and skewed**, we must drop the broadcast hint entirely and rely on a **Distributed Shuffle Sort-Merge Join powered by Dual-Side Salting**.
+
+Here is how the architecture adapts when the trade table is just as large as the 10.5-crore market tick table.
+
+---
+
+### The Strategy for Large-to-Large Skewed Joins
+
+When both tables are huge, Spark cannot copy one to memory. Instead, it must shuffle both datasets across the cluster so matching keys land on the same executor core. Without intervention, symbol skew makes this fail. Here is how our previous design handles it without broadcasting:
+
+#### 1. Dual-Side Salting (The Secret to Large-Large Joins)
+
+Because symbol 'A' is heavy on *both* the market side and the trade side, sorting and merging them normally would bottleneck all records of 'A' into a single task.
+
+* By applying the **exact same hashing logic (`ABS(hash(...) % N)`)** to both the exploded trade table and the market tick table using the shared keys (`date`, `sym`, `time_bucket`), we artificially split symbol 'A' into $N$ parallel sub-streams on **both sides**.
+* When Spark executes the Shuffle Sort-Merge Join, it matches trade salt bucket `0` with market salt bucket `0`, trade salt bucket `1` with market salt bucket `1`, and so on.
+
+#### 2. Removing the Broadcast Hint (Falling Back to Sort-Merge Join)
+
+By removing `/*+ BROADCAST(t) */`, Spark performs a distributed **Shuffle Sort-Merge Join**.
+
+* **How it works:** Both datasets are shuffled across the network based on the composite key `(date, sym, time_bucket, salt_key)`. Because we salted the heavy keys, the network shuffle load is evenly distributed across all worker nodes rather than concentrated on a single node.
+
+---
+
+### Updated SQL Architecture (Large-to-Large Join)
+
+Notice that the only structural change is **removing the broadcast hint** and letting Catalyst use its distributed Sort-Merge engine, protected by our dual-side salt keys:
+
+```sql
+-- --- STEP 4: LARGE-TO-LARGE OPTIMIZED SORT-MERGE JOIN (NO BROADCAST) ---
+-- Both tables are large; Spark shuffles both safely using the salt keys
+CREATE OR REPLACE TEMPORARY VIEW joined_market_trades AS
+SELECT 
+    t.trade_id,
+    t.sym,
+    t.st,
+    t.end,
+    m.market_timestamp,
+    m.price
+FROM binned_salted_trades t
+INNER JOIN binned_salted_market m
+  ON t.date = m.date 
+  AND t.sym = m.sym 
+  AND t.time_bucket = m.time_bucket 
+  AND t.salt_key = m.salt_key
+WHERE m.market_timestamp >= t.st 
+  AND m.market_timestamp <= t.end;
+
+```
+
+---
+
+### Production Level-Up: Physical Bucketing (`bucketBy`)
+
+If this trade-to-market join is a recurring pipeline (e.g., run daily), doing an active shuffle every time is expensive. You can eliminate the shuffle entirely by **physically pre-bucketing and sorting** both tables on disk before writing them to your data lake (Delta / Parquet):
+
+```python
+# Save trade data physically pre-bucketed and sorted on disk
+trade_expanded_df.write \
+    .format("delta") \
+    .bucketBy(16, "date", "sym", "time_bucket") \
+    .sortBy("date", "sym", "time_bucket", "trade_id") \
+    .saveAsTable("bucketed_trades")
+
+# Save market data with the exact same physical layout
+market_binned_df.write \
+    .format("delta") \
+    .bucketBy(16, "date", "sym", "time_bucket") \
+    .sortBy("date", "sym", "time_bucket", "market_timestamp") \
+    .saveAsTable("bucketed_market")
+
+```
+
+**Why this is the ultimate HFT optimization:** When two tables are physically bucketed and sorted by the join keys using the same number of buckets, Spark's Catalyst optimizer **skips the entire shuffle phase completely**. The join happens locally on the executors during a pure Sort-Merge, even if both tables span hundreds of millions of rows.
+
+
+Here is the complete, self-contained, production-ready PySpark script implementing the large-to-large skewed HFT interval join architecture.
+
+It handles massive datasets without broadcasting by utilizing **time-bucket expansion**, **dual-side core-aligned salting**, and **single-pass aggregations via `min_by`/`max_by**`.
+
+```python
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+
+# ==========================================
+# 1. INITIALIZE SPARK SESSION
+# ==========================================
+spark = SparkSession.builder \
+    .appName("HFTLargeScaleIntervalJoinPipeline") \
+    .master("local[*]") \
+    .config("spark.sql.shuffle.partitions", "200") \
+    .getOrCreate()
+
+
+# ==========================================
+# 2. SIMULATED DATA SETUP (Large-to-Large Scale)
+# ==========================================
+# Simulated High-Frequency Market Ticks (~10,000 records/sec scale)
+market_data = spark.createDataFrame([
+    ("2026-11-03", "A", "2026-11-03 09:00:05.100", 150.50),
+    ("2026-11-03", "A", "2026-11-03 09:00:12.500", 151.20),
+    ("2026-11-03", "A", "2026-11-03 09:00:45.800", 149.90),
+    ("2026-11-03", "A", "2026-11-03 09:05:02.000", 149.80),
+    ("2026-11-03", "B", "2026-11-03 09:02:10.100", 2500.00),
+    ("2026-11-03", "B", "2026-11-03 09:08:30.400", 2495.50),
+], ["date", "sym", "market_timestamp", "price"])
+market_data.createOrReplaceTempView("market_data")
+
+# Simulated Massive Trade Data with overlapping st (start) and end intervals
+trade_data = spark.createDataFrame([
+    ("Trd_1", "2026-11-03", "A", "2026-11-03 09:00:00", "2026-11-03 09:10:00"),
+    ("Trd_2", "2026-11-03", "A", "2026-11-03 09:05:00", "2026-11-03 09:15:00"),
+    ("Trd_3", "2026-11-03", "B", "2026-11-03 09:01:00", "2026-11-03 09:10:00"),
+], ["trade_id", "date", "sym", "st", "end"])
+trade_data.createOrReplaceTempView("trade_data")
+
+
+# ==========================================
+# 3. STEP 1: EXPAND TRADE INTERVALS INTO MINUTE BUCKETS
+# ==========================================
+# Uses SQL sequence() and explode() to map multi-minute/hour trades into discrete 1-minute slices
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW expanded_trades AS
+    SELECT 
+        trade_id,
+        date,
+        sym,
+        st,
+        end,
+        date_format(bucket_ts, 'yyyy-MM-dd HH:mm') AS time_bucket
+    FROM trade_data
+    LATERAL VIEW explode(
+        sequence(
+            date_trunc('minute', CAST(st AS TIMESTAMP)), 
+            date_trunc('minute', CAST(end AS TIMESTAMP)), 
+            INTERVAL 1 MINUTE
+        )
+    ) AS bucket_ts
+""")
+
+
+# ==========================================
+# 4. STEP 2: BIN MARKET TICKS & APPLY DUAL-SIDE SALTING
+# ==========================================
+# Skewed symbols ('A', 'B') are shredded across 8 virtual salt buckets (N=8) 
+# to evenly distribute partitions across cluster cores during shuffle.
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW binned_salted_market AS
+    SELECT 
+        date,
+        sym,
+        market_timestamp,
+        price,
+        date_format(CAST(market_timestamp AS TIMESTAMP), 'yyyy-MM-dd HH:mm') AS time_bucket,
+        CASE 
+            WHEN sym IN ('A', 'B') THEN ABS(hash(market_timestamp) % 8)
+            ELSE 0 
+        END AS salt_key
+    FROM market_data
+""")
+
+
+# ==========================================
+# 5. STEP 3: APPLY CORRESPONDING SALTING TO TRADES
+# ==========================================
+# Must use the exact same modulo factor (8) and key logic so matching records collide correctly
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW binned_salted_trades AS
+    SELECT 
+        trade_id,
+        date,
+        sym,
+        st,
+        end,
+        time_bucket,
+        CASE 
+            WHEN sym IN ('A', 'B') THEN ABS(hash(trade_id) % 8)
+            ELSE 0 
+        END AS salt_key
+    FROM expanded_trades
+""")
+
+
+# ==========================================
+# 6. STEP 4: LARGE-TO-LARGE SORT-MERGE JOIN (NO BROADCAST)
+# ==========================================
+# Both datasets are large. Spark performs a distributed Shuffle Sort-Merge Join 
+# safely balanced by our dual-side salt keys, followed by precise millisecond filtering.
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW joined_market_trades AS
+    SELECT 
+        t.trade_id,
+        t.sym,
+        t.st,
+        t.end,
+        m.market_timestamp,
+        m.price
+    FROM binned_salted_trades t
+    INNER JOIN binned_salted_market m
+      ON t.date = m.date 
+      AND t.sym = m.sym 
+      AND t.time_bucket = m.time_bucket 
+      AND t.salt_key = m.salt_key
+    WHERE m.market_timestamp >= t.st 
+      AND m.market_timestamp <= t.end
+""")
+
+
+# ==========================================
+# 7. STEP 5: FINAL METRIC CALCULATION (SINGLE-PASS AGGREGATION)
+# ==========================================
+# Uses MIN_BY and MAX_BY to compute exact price points and their associated timestamps 
+# without requiring heavy secondary window sorting passes.
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW hft_trade_metrics AS
+    SELECT 
+        trade_id,
+        sym,
+        st,
+        end,
+        -- Market Data Availability / Total Tick Count
+        COUNT(market_timestamp) AS total_tick_count,
+        
+        -- Price Extremes
+        MIN(price) AS min_price,
+        MAX(price) AS max_price,
+        
+        -- Timestamps of Price Extremes
+        MIN_BY(market_timestamp, price) AS timestamp_of_min_price,
+        MAX_BY(market_timestamp, price) AS timestamp_of_max_price,
+        
+        -- First Price within range (Price associated with the earliest tick timestamp)
+        MIN_BY(price, market_timestamp) AS first_price
+    FROM joined_market_trades
+    GROUP BY trade_id, sym, st, end
+""")
+
+
+# ==========================================
+# 8. EXECUTE AND DISPLAY RESULTS
+# ==========================================
+print("=== COMPUTED HFT MARKET DATA METRICS ===")
+spark.sql("SELECT * FROM hft_trade_metrics").show(truncate=False)
+
+spark.stop()
+
+```
+
+When dealing with massive HFT datasets (10.5+ crore rows), naive deduplication using standard transforms like `dropDuplicates()` forces a full-table shuffle and can easily choke executors. Similarly, heavy window functions (`ROW_NUMBER() OVER (...)`) can introduce severe memory overhead if partitions are large or skewed.
+
+To efficiently remove duplicates and isolate the **latest trade or tick**, two enterprise-grade patterns stand out in Spark SQL.
+
+---
+
+### Method 1: The `MAX_BY` Trick (Fastest for Single Fields)
+
+If you only need to extract a specific metric (like the latest price or latest status) associated with the most recent timestamp, you can use **`MAX_BY`** inside a `GROUP BY`.
+
+Because it operates as a native aggregate function rather than a ranking window, Spark optimizes it heavily without sorting massive partition streams.
+
+```sql
+-- Example: Get the latest price and latest timestamp per trade_id
+SELECT 
+    trade_id,
+    sym,
+    -- Get the timestamp of the latest tick
+    MAX(market_timestamp) AS latest_timestamp,
+    -- Get the price associated with the maximum (latest) timestamp in a single pass
+    MAX_BY(price, market_timestamp) AS latest_price
+FROM joined_market_trades
+GROUP BY trade_id, sym
+
+```
+
+#### What if you need multiple columns for the latest trade?
+
+You can combine `MAX_BY` with a **`STRUCT`** to capture an entire row's attributes at the exact peak timestamp:
+
+```sql
+SELECT 
+    trade_id,
+    sym,
+    -- Pack multiple fields into a struct evaluated at the maximum timestamp
+    MAX_BY(STRUCT(price, volume, order_status, market_timestamp), market_timestamp) AS latest_trade_details
+FROM joined_market_trades
+GROUP BY trade_id, sym
+
+```
+
+---
+
+### Method 2: Optimized Window Rank (`ROW_NUMBER()`)
+
+If your deduplication logic requires keeping entire rows or evaluating complex tie-breaking rules where `MAX_BY` is insufficient, you must use a window function. To make it scale on 10.5+ crore rows, ensure your **partition key is well-distributed** and avoid global ordering bottlenecks.
+
+```sql
+CREATE OR REPLACE TEMPORARY VIEW deduped_latest_trades AS
+WITH ranked_trades AS (
+    SELECT 
+        trade_id,
+        sym,
+        market_timestamp,
+        price,
+        volume,
+        -- Assign rank 1 to the absolute latest record per trade_id
+        ROW_NUMBER() OVER (
+            PARTITION BY trade_id 
+            ORDER BY market_timestamp DESC, 
+                     -- Secondary tie-breaker if timestamps match down to the millisecond
+                     internal_sequence_id DESC 
+        ) as rn
+    FROM joined_market_trades
+)
+SELECT 
+    trade_id,
+    sym,
+    market_timestamp AS latest_timestamp,
+    price AS latest_price,
+    volume AS latest_volume
+FROM ranked_trades
+WHERE rn = 1;
+
+```
+
+---
+
+### Architectural Rule of Thumb for HFT Deduplication
+
+1. **Use `MAX_BY**` whenever you are aggregating attributes to find the latest state. It runs faster, consumes less memory, and avoids shuffle-heavy sort phases.
+2. **Use Windowed `ROW_NUMBER()**` strictly when you need to filter or retain distinct entire rows based on multi-column tie-breakers. Ensure your partition key (`PARTITION BY trade_id`) does not suffer from extreme skew; if it does, apply the **salting techniques** discussed earlier before running the window block.
+
+
+Here is a complete, runnable PySpark SQL example demonstrating both deduplication patterns: **Method 1 (`MAX_BY` with `STRUCT`)** for extracting multiple fields at the latest timestamp without heavy shuffling, and **Method 2 (Windowed `ROW_NUMBER()`)** for retaining full-row details with multi-column tie-breakers.
+
+---
+
+### Complete PySpark Example: Deduplicating & Finding Latest Trades
+
+```python
+from pyspark.sql import SparkSession
+
+# 1. Initialize Spark Session
+spark = SparkSession.builder \
+    .appName("HFTDeduplicationMasterclass") \
+    .master("local[*]") \
+    .getOrCreate()
+
+# 2. Simulated HFT Data with Duplicate/Multiple Updates for the Same Trade/Symbol
+# Notice that Trd_1 has multiple updates at the exact same millisecond or sequential timestamps
+raw_updates = spark.createDataFrame([
+    ("Trd_1", "A", "2026-11-03 09:00:05.100", 150.50, 100, "PENDING"),
+    ("Trd_1", "A", "2026-11-03 09:00:05.100", 150.75, 500, "EXECUTED"), # Duplicate timestamp, updated price/qty/status
+    ("Trd_1", "A", "2026-11-03 09:00:12.500", 151.00, 200, "CONFIRMED"), # Later timestamp
+    ("Trd_2", "B", "2026-11-03 09:01:00.200", 2500.00, 50, "PENDING"),
+    ("Trd_2", "B", "2026-11-03 09:01:02.800", 2505.50, 50, "CONFIRMED"), # Later timestamp
+], ["trade_id", "sym", "market_timestamp", "price", "quantity", "order_status"])
+
+raw_updates.createOrReplaceTempView("raw_updates")
+
+
+# ==========================================
+# APPROACH 1: THE MAX_BY + STRUCT TRICK
+# ==========================================
+# Best for performance: Evaluates in a single aggregate pass without sorting partitions.
+# Packs multiple fields into a struct evaluated at the maximum (latest) timestamp.
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW latest_trade_struct_dedup AS
+    SELECT 
+        trade_id,
+        sym,
+        MAX(market_timestamp) AS latest_timestamp,
+        -- Extract all attributes corresponding to the absolute latest timestamp
+        MAX_BY(
+            STRUCT(price, quantity, order_status), 
+            market_timestamp
+        ) AS latest_state
+    FROM raw_updates
+    GROUP BY trade_id, sym
+""")
+
+print("=== APPROACH 1: MAX_BY + STRUCT RESULTS ===")
+spark.sql("""
+    SELECT 
+        trade_id, 
+        sym, 
+        latest_timestamp, 
+        latest_state.price AS price, 
+        latest_state.quantity AS quantity, 
+        latest_state.order_status AS order_status
+    FROM latest_trade_struct_dedup
+""").show(truncate=False)
+
+
+# ==========================================
+# APPROACH 2: OPTIMIZED WINDOW RANK (ROW_NUMBER)
+# ==========================================
+# Best when you have complex multi-column tie-breakers (e.g., sequence IDs) 
+# and need to retain entire distinct rows.
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW latest_trade_window_dedup AS
+    WITH ranked_updates AS (
+        SELECT 
+            trade_id,
+            sym,
+            market_timestamp,
+            price,
+            quantity,
+            order_status,
+            ROW_NUMBER() OVER (
+                PARTITION BY trade_id 
+                ORDER BY market_timestamp DESC, 
+                         -- Tie-breaker if multiple rows hit the exact same millisecond
+                         quantity DESC 
+            ) as rn
+        FROM raw_updates
+    )
+    SELECT 
+        trade_id,
+        sym,
+        market_timestamp AS latest_timestamp,
+        price,
+        quantity,
+        order_status
+    FROM ranked_updates
+    WHERE rn = 1
+""")
+
+print("=== APPROACH 2: WINDOWED ROW_NUMBER RESULTS ===")
+spark.sql("SELECT * FROM latest_trade_window_dedup").show(truncate=False)
+
+spark.stop()
+
+```
+
+---
+
+### Key Takeaways from the Output
+
+* **For `Trd_1**`, both methods successfully discard the stale `PENDING` status and `150.50` price, retaining either the `151.00` confirmation or the highest-priority update depending on your sorting criteria.
+* **Approach 1** avoids shuffle-heavy sort phases entirely by leveraging aggregate map-side combination, making it the preferred choice for massive scale unless complex custom tie-breakers force a windowed ranking.
+
+
+To understand why **Bucket-Based Partitioned Join** (time-bucket binning) is a lifesaver, it helps to look at the visual difference between a **naive global interval join** and a **bucketed equi-join**.
+
+When dealing with 10.5+ crore market ticks, the way Spark matches rows changes from an unconstrained search to a precise box-to-box alignment.
+
+---
+
+### The Problem: Why a Naive Interval Join Explodes
+
+Imagine you have a single trade window and a continuous stream of market ticks for Symbol `A` over a full trading day:
+
+```text
+Trade 1 Window:  [ 09:00:00  ==============================>  09:10:00 ]
+
+Market Ticks:    * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * ... (10.5 Crore ticks from 09:00 to 16:00)
+                 ^                                                                                     ^
+         Spark must check EVERY tick                          ...even ticks at 15:45:12 that have zero relevance!
+         against the trade window!
+
+```
+
+**What Spark has to do:** Without a coarse boundary, Spark's execution engine has to evaluate the condition `market_timestamp BETWEEN st AND end` across the entire dataset. For every single trade, Spark scans billions of rows to see if they fit. This causes a massive **Cartesian cross-join explosion**, crashing executors with OOM errors.
+
+---
+
+### The Solution: How Bucket-Based Partitioning Works
+
+Instead of checking every tick across the entire day, we discretize time into **1-minute buckets** and align both datasets into discrete "boxes."
+
+#### Step 1: Bucket the Market Ticks
+
+Every market tick is stamped with the minute it belongs to:
+
+* `09:00:05.100` $\rightarrow$ belongs to bucket **`09:00`**
+* `09:00:12.500` $\rightarrow$ belongs to bucket **`09:00`**
+* `09:05:02.000` $\rightarrow$ belongs to bucket **`09:05`**
+
+#### Step 2: Explode the Trade Intervals Across Buckets
+
+A trade spanning `09:00:00` to `09:10:00` is replicated into individual rows for every minute it touches:
+
+* Trade 1 $\rightarrow$ Buckets: `09:00`, `09:01`, `09:02`, ..., `09:10`
+
+#### Step 3: The Box-to-Box Equi-Join Representation
+
+Now, instead of a loose inequality (`BETWEEN`), Spark performs an **exact equality join** on the buckets. Think of it as sorting items into physical filing cabinets:
+
+| Filing Cabinet (`time_bucket`) | What's Inside the Trade Box? | What's Inside the Market Ticks Box? | Spark's Action |
+| --- | --- | --- | --- |
+| **`09:00`** | Trade 1 | Ticks at `09:00:05`, `09:00:12`, etc. | **Matches instantly** (Only compares ticks inside this 1-minute box) |
+| **`09:01`** | Trade 1 | Ticks at `09:01:10`, `09:01:45`, etc. | **Matches instantly** |
+| **`09:05`** | Trade 1 **AND** Trade 2 | Ticks at `09:05:02`, `09:05:50`, etc. | **Matches both trades** against ticks in this box |
+| **`15:45`** | *(No Trade Exists Here)* | Ticks at `15:45:12` | **Skipped entirely!** Spark never even looks at these rows. |
+
+---
+
+### Summary of the Benefit
+
+1. **Destroys the Search Space:** Spark no longer compares a trade at `09:00` against market ticks at `15:45`. The search space shrinks from *billions of global rows* to *a few thousand rows within matching minute boxes*.
+2. **Turns Inequality into Equi-Join:** By matching on `time_bucket` (an exact string/timestamp match) and `salt_key`, Spark turns a slow, heavy interval scan into a fast **Sort-Merge Join**.
+3. **Precise Filtering at Zero Cost:** Any ticks that fell into the same minute box but sat slightly outside the exact seconds (e.g., a tick at `09:00:00` when the trade started at `09:00:30`) are instantly cleaned up by a lightweight post-join filter (`market_timestamp >= st`), having already bypassed the heavy shuffle bottleneck.
+
+
+Yes, you are completely right to point that out—exploding the trade table across multiple minute buckets **does increase the row count of the trade side.**
+
+However, in big data architecture, we accept a **controlled, linear data expansion** on the *smaller* side to prevent a **catastrophic, exponential data explosion** across the *entire* dataset.
+
+---
+
+### The Scale Math: Why the Expansion is Safe
+
+Let’s look at the actual scale asymmetry in an HFT pipeline:
+
+1. **Market Ticks:** 10.5+ **crore** rows (105,000,000+ records per day).
+2. **Trades:** Typically orders of magnitude smaller (e.g., tens or hundreds of thousands of trades per day).
+
+#### What happens during expansion?
+
+If a trade lasts for **10 minutes**, it gets duplicated into 10 rows (one for each minute bucket).
+
+* If you have 100,000 trades, and the average trade spans 10 minutes, your exploded trade table grows to roughly **1 million rows**.
+* Compare that to your **10.5 crore market ticks**. 1 million rows is less than **1%** of your market tick volume.
+
+Even if a trade spans an hour (60 rows), the exploded trade table remains lightweight compared to the massive tick stream.
+
+---
+
+### Controlled Expansion vs. Cartesian Explosion
+
+| Approach | What Happens to Data Size? | Compute Impact on Cluster |
+| --- | --- | --- |
+| **Naive Interval Join (`BETWEEN st AND end`)** | Zero expansion upfront. | **Catastrophic.** Spark attempts to evaluate 10.5 crore rows against trade windows globally, causing a combinatorial explosion, massive shuffle spills, and Driver OOMs. |
+| **Time-Bucket Expansion (`sequence` + `explode`)** | Trade table expands by a factor equal to its duration in minutes (e.g., $1\times$ to $60\times$). | **Highly Efficient.** Restricts matches strictly to matching minute boxes, turning a heavy inequality join into a clean equi-join. |
+
+By duplicating the trade rows across time buckets, you are essentially pre-indexing the trades so Spark knows exactly *which* minute partition to look into.
+
+---
+
+### How to Protect Against Extreme Expansion (Edge Cases)
+
+What if you have a rogue trade that spans **12 hours** (720 minutes)? Exploding a single trade into 720 rows starts bloating the trade table unnecessarily. You can protect your pipeline with these adjustments:
+
+1. **Choose a Wider Bucket Size:** If trades routinely span hours, use **5-minute** or **15-minute buckets** instead of 1-minute buckets. A 12-hour trade exploded into 1-minute buckets creates 720 rows; in 15-minute buckets, it creates only 48 rows.
+2. **Cap Maximum Duration or Split Intervals:** If long-running positions exist, split them into fixed-size session chunks during ingestion rather than letting a single trade span an entire trading day.
+
+To prevent the trade table from bloating when trades span long durations (e.g., hours or all day), you can easily adjust the interval size inside the Spark SQL `sequence()` function from **1 minute** to **15 minutes** or **1 hour**.
+
+By widening the bucket window, a trade spanning 4 hours gets exploded into only **16 rows** (if using 15-minute buckets) instead of **240 rows** (if using 1-minute buckets), while still protecting your pipeline from a global cross-join.
+
+---
+
+### Example: Using 15-Minute Buckets to Control Row Inflation
+
+Here is how you update the expansion logic in Spark SQL:
+
+```python
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .appName("HFTOptimizedBucketExpansion") \
+    .master("local[*]") \
+    .getOrCreate()
+
+# Simulated trade data where a trade lasts for 3 hours (09:00 to 12:00)
+trade_data = spark.createDataFrame([
+    ("Trd_Long_1", "2026-11-03", "A", "2026-11-03 09:00:00", "2026-11-03 12:00:00"),
+], ["trade_id", "date", "sym", "st", "end"])
+trade_data.createOrReplaceTempView("trade_data")
+
+# Simulated market ticks across that morning
+market_data = spark.createDataFrame([
+    ("2026-11-03", "A", "2026-11-03 10:30:15.100", 152.50),
+], ["date", "sym", "market_timestamp", "price"])
+market_data.createOrReplaceTempView("market_data")
+
+
+# ==========================================
+# WIDER BUCKET EXPANSION (e.g., 15-MINUTE INTERVALS)
+# ==========================================
+spark.sql("""
+    CREATE OR REPLACE TEMPORARY VIEW expanded_trades_15min AS
+    SELECT 
+        trade_id,
+        date,
+        sym,
+        st,
+        end,
+        -- Truncate and group into 15-minute blocks
+        date_format(bucket_ts, 'yyyy-MM-dd HH:mm') AS time_bucket
+    FROM trade_data
+    LATERAL VIEW explode(
+        sequence(
+            date_trunc('hour', CAST(st AS TIMESTAMP)), 
+            date_trunc('hour', CAST(end AS TIMESTAMP)), 
+            -- CHANGED FROM 1 MINUTE TO 15 MINUTES
+            INTERVAL 15 MINUTE
+        )
+    ) AS bucket_ts
+""")
+
+print("=== EXPANDED TRADES WITH 15-MIN BUCKETS ===")
+spark.sql("SELECT * FROM expanded_trades_15min").show(truncate=False)
+
+```
+
+---
+
+### How the Market Side Matches Wider Buckets
+
+To join market ticks against these wider 15-minute trade buckets, you must bucket the market ticks into matching 15-minute blocks as well.
+
+You can create a helper expression in SQL that floors timestamps to the nearest 15 minutes:
+
+```sql
+CREATE OR REPLACE TEMPORARY VIEW binned_market_15min AS
+SELECT 
+    date,
+    sym,
+    market_timestamp,
+    price,
+    -- Group market ticks into 15-minute floor windows to match the exploded trade buckets
+    date_format(
+        from_unixtime(
+            floor(unix_timestamp(CAST(market_timestamp AS TIMESTAMP)) / 900) * 900
+        ), 
+        'yyyy-MM-dd HH:mm'
+    ) AS time_bucket,
+    CASE WHEN sym IN ('A', 'B') THEN ABS(hash(market_timestamp) % 8) ELSE 0 END AS salt_key
+FROM market_data;
+
+```
+
+*(Note: `900 seconds = 15 minutes`. Dividing the epoch timestamp by 900, flooring it, and converting it back floors any timestamp down to its nearest 15-minute block).*
+
+---
+
+### Summary of Trade-offs
+
+| Bucket Interval | Exploded Rows per 1-Hour Trade | Search Space Efficiency | Row Inflation Risk |
+| --- | --- | --- | --- |
+| **1 Minute** | 60 rows | **Maximum precision.** Skips almost all irrelevant ticks. | Higher if you have many long-running trades. |
+| **15 Minutes** | 4 rows | **High efficiency.** Shrinks search space by 96% compared to global join. | **Very Low.** Keeps the trade table lightweight. |
+| **1 Hour** | 1 row | **Moderate efficiency.** Still better than global join, but broader box matching. | **Minimal.** |
+
+**Best Practice:** If your trades typically last under 30 minutes, stick with **1-minute buckets** (the row explosion is negligible). If you have trades spanning multiple hours or entire trading days, switch to **15-minute or 1-hour buckets** to keep your exploded trade dataframe lean.

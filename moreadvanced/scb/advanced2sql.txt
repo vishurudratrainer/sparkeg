@@ -1,0 +1,533 @@
+Here is a comprehensive masterclass script featuring **20 advanced Spark SQL optimization patterns** complete with mock data setup, bad vs. good SQL queries, and executable code so you can verify how the Catalyst Optimizer and execution engine handle them.
+
+---
+
+### Masterclass Setup: Mock Data Initialization
+
+```python
+from pyspark.sql import SparkSession
+import pyspark.sql.functions as F
+
+spark = SparkSession.builder \
+    .appName("Advanced_SQL_Optimizations_Lab") \
+    .config("spark.sql.shuffle.partitions", "4") \
+    .master("local[*]") \
+    .getOrCreate()
+
+# --- Initialize Mock Tables ---
+spark.createDataFrame([(1, "Cust_A", 100.0, "2026-01-01"), (2, "Cust_B", 250.0, "2026-01-02"), (3, "Cust_A", 150.0, "2026-01-03")], ["order_id", "customer_id", "amount", "order_date"]).createOrReplaceTempView("orders")
+spark.createDataFrame([("Cust_A", "VIP"), ("Cust_B", "Standard")], ["customer_id", "tier"]).createOrReplaceTempView("customers")
+spark.createDataFrame([(1, "Log_A"), (2, "Log_B")], ["log_id", "message"]).createOrReplaceTempView("logs_a")
+spark.createDataFrame([(2, "Log_B"), (3, "Log_C")], ["log_id", "message"]).createOrReplaceTempView("logs_b")
+spark.createDataFrame([("Electronics", 1200.0), ("Clothing", 300.0), ("Electronics", 800.0)], ["category", "sales"]).createOrReplaceTempView("sales_data")
+spark.createDataFrame([("u1", "Active"), ("u2", "Inactive"), ("u3", "Pending")], ["user_id", "status"]).createOrReplaceTempView("user_status")
+spark.createDataFrame([("u1", 10), ("u1", 20), ("u2", 30)], ["user_id", "score"]).createOrReplaceTempView("user_scores")
+
+```
+
+---
+
+### Category 1: Join & Shuffle Optimizations (Examples 1–4)
+
+#### 1. Forcing Broadcast Hash Joins on Small Dimensions
+
+* **Bad:** Relying on auto-broadcast thresholds for dimension tables, risking accidental Sort-Merge shuffles.
+* **Good:** Explicitly using the `/*+ BROADCAST(c) */` hint.
+
+```python
+# Bad: Sort-Merge Join (Shuffle)
+spark.sql("SELECT o.order_id, c.tier FROM orders o JOIN customers c ON o.customer_id = c.customer_id").explain()
+
+# Good: Broadcast Hash Join (Zero Shuffle)
+spark.sql("SELECT /*+ BROADCAST(c) */ o.order_id, c.tier FROM orders o JOIN customers c ON o.customer_id = c.customer_id").explain()
+
+```
+
+#### 2. Using `LEFT SEMI JOIN` instead of `IN (Subquery)`
+
+* **Bad:** Using `IN` with large subqueries can trigger expensive subquery execution phases.
+* **Good:** Using `LEFT SEMI JOIN` which optimizes directly as a broadcast or hash join.
+
+```python
+# Bad: IN subquery
+spark.sql("SELECT * FROM customers WHERE customer_id IN (SELECT customer_id FROM orders)").show()
+
+# Good: Left Semi Join
+spark.sql("SELECT c.* FROM customers c LEFT SEMI JOIN orders o ON c.customer_id = o.customer_id").show()
+
+```
+
+#### 3. Replacing `UNION` with `UNION ALL`
+
+* **Bad:** `UNION` performs an implicit `DISTINCT` operation across all rows, forcing a heavy shuffle and sort.
+* **Good:** `UNION ALL` bypasses distinct checking entirely when duplicate retention is acceptable or pre-filtered.
+
+```python
+# Bad: UNION (Forces shuffle/sort for distinct elimination)
+spark.sql("SELECT message FROM logs_a UNION SELECT message FROM logs_b").show()
+
+# Good: UNION ALL (Zero overhead append)
+spark.sql("SELECT message FROM logs_a UNION ALL SELECT message FROM logs_b").show()
+
+```
+
+#### 4. Avoiding Global Sort via `ORDER BY` without `LIMIT`
+
+* **Bad:** `ORDER BY` without `LIMIT` funnels all data into a single reducer partition for global sorting.
+* **Good:** Using `SORT BY` or `DISTRIBUTE BY` when local partition ordering is sufficient.
+
+```python
+# Bad: Global sort bottleneck (1 reducer partition)
+spark.sql("SELECT * FROM orders ORDER BY amount").explain()
+
+# Good: Distributed local sorting
+spark.sql("SELECT * FROM orders DISTRIBUTE BY customer_id SORT BY amount").explain()
+
+```
+
+---
+
+### Category 2: Predicate Pushdown & Partition Pruning (Examples 5–8)
+
+#### 5. Avoiding Functions on Partition Columns
+
+* **Bad:** Wrapping date columns in functions (`SUBSTR()`, `YEAR()`) breaks partition pruning.
+* **Good:** Using direct range comparisons on raw partition columns.
+
+```python
+# Bad: Full table scan
+spark.sql("SELECT * FROM orders WHERE SUBSTR(order_date, 1, 4) = '2026'").explain()
+
+# Good: File-system partition pruning enabled
+spark.sql("SELECT * FROM orders WHERE order_date >= '2026-01-01' AND order_date < '2027-01-01'").explain()
+
+```
+
+#### 6. Early Filtering Before Joins
+
+* **Bad:** Joining massive tables completely before applying `WHERE` filters.
+* **Good:** Pushing filters down into CTEs or subqueries before the join phase.
+
+```python
+# Bad: Joins entire tables then filters
+spark.sql("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.customer_id WHERE o.amount > 200").explain()
+
+# Good: Filters rows early, minimizing join payload
+spark.sql("SELECT * FROM (SELECT * FROM orders WHERE amount > 200) o JOIN customers c ON o.customer_id = c.customer_id").explain()
+
+```
+
+#### 7. Avoiding Implicit Type Casting in Predicates
+
+* **Bad:** Comparing string columns against numeric literals.
+* **Good:** Matching data types explicitly.
+
+```python
+# Bad: Implicit cast on customer_id
+spark.sql("SELECT * FROM customers WHERE customer_id = 123").explain()
+
+# Good: Exact type match
+spark.sql("SELECT * FROM customers WHERE customer_id = 'Cust_A'").explain()
+
+```
+
+#### 8. Column Pruning via Strict Selection
+
+* **Bad:** Using `SELECT *` on wide schemas.
+* **Good:** Selecting only required columns so Catalyst prunes disk I/O.
+
+
+
+```python
+# Bad: Reads all columns
+spark.sql("SELECT * FROM orders").explain()
+
+# Good: Prunes unneeded column blocks from storage
+spark.sql("SELECT order_id, amount FROM orders").explain()
+
+```
+
+---
+
+### Category 3: Aggregations & Grouping (Examples 9–12)
+
+#### 9. Approximate Distinct Counting (`APPROX_COUNT_DISTINCT`)
+
+* **Bad:** Exact `COUNT(DISTINCT)` requires heavy sorting and shuffling.
+* **Good:** Using HyperLogLog approximations for massive datasets.
+
+```python
+# Bad: Exact distinct sort shuffle
+spark.sql("SELECT category, COUNT(DISTINCT sales) FROM sales_data GROUP BY category").show()
+
+# Good: Fast probabilistic estimation
+spark.sql("SELECT category, APPROX_COUNT_DISTINCT(sales) FROM sales_data GROUP BY category").show()
+
+```
+
+#### 10. Multi-Level Rollups via `GROUPING SETS`
+
+* **Bad:** Running multiple separate queries joined by `UNION ALL` for subtotals.
+* **Good:** Single-pass `GROUPING SETS` computation.
+
+```python
+# Bad: Multiple table scans
+spark.sql("SELECT category, SUM(sales) FROM sales_data GROUP BY category UNION ALL SELECT null, SUM(sales) FROM sales_data").show()
+
+# Good: Single-pass multi-dimensional rollup
+spark.sql("SELECT category, SUM(sales) FROM sales_data GROUP BY GROUPING SETS ((category), ())").show()
+
+```
+
+#### 11. Conditional Aggregation Short-Circuiting (`FILTER`)
+
+* **Bad:** Verbose `CASE WHEN` statements for conditional counting.
+* **Good:** Clean SQL `FILTER (...)` syntax.
+
+```python
+# Bad: CASE WHEN conditional aggregate
+spark.sql("SELECT SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) FROM user_status").show()
+
+# Good: Modern FILTER clause
+spark.sql("SELECT COUNT(*) FILTER (WHERE status = 'Active') FROM user_status FROM user_status").show()
+
+```
+
+#### 12. Avoiding High-Cardinality Grouping Keys
+
+* **Bad:** Grouping by exact millisecond timestamps or unique IDs.
+* **Good:** Truncating or bucketing high-cardinality keys first.
+
+```python
+# Bad: High cardinality grouping explosion
+spark.sql("SELECT order_date, COUNT(*) FROM orders GROUP BY order_date").explain()
+
+# Good: Lower cardinality bucketed grouping
+spark.sql("SELECT SUBSTR(order_date, 1, 7) as ym, COUNT(*) FROM orders GROUP BY SUBSTR(order_date, 1, 7)").explain()
+
+```
+
+---
+
+### Category 4: Window Functions & Subqueries (Examples 13–16)
+
+#### 13. Window Framing Clauses (`ROWS BETWEEN`)
+
+* **Bad:** Omitting framing clauses, causing Spark to default to memory-intensive `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` which requires peer evaluations.
+* **Good:** Explicitly specifying physical `ROWS BETWEEN` frames.
+
+```python
+# Bad: Range-based window (higher memory overhead)
+spark.sql("SELECT customer_id, amount, SUM(amount) OVER (PARTITION BY customer_id ORDER BY order_date) FROM orders").explain()
+
+# Good: Optimized physical row-offset frame
+spark.sql("SELECT customer_id, amount, SUM(amount) OVER (PARTITION BY customer_id ORDER BY order_date ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM orders").explain()
+
+```
+
+#### 14. Replacing Self-Joins with `LAG()` / `LEAD()`
+
+* **Bad:** Using self-joins with offset index arithmetic to compare sequential rows.
+* **Good:** Using single-pass columnar window functions.
+
+```python
+# Bad: Self-join overhead
+spark.sql("SELECT o1.order_id, o1.amount - o2.amount FROM orders o1 JOIN orders o2 ON o1.customer_id = o2.customer_id AND o1.order_id = o2.order_id + 1").show()
+
+# Good: Single pass LAG window function
+spark.sql("SELECT order_id, amount - LAG(amount, 1, 0) OVER (PARTITION BY customer_id ORDER BY order_date) FROM orders").show()
+
+```
+
+#### 15. De-duplication via CTE Ranking instead of Subquery Max
+
+* **Bad:** Correlated subqueries with `MAX(timestamp)` to find latest records.
+* **Good:** Window ranking (`ROW_NUMBER()`) inside a CTE.
+
+```python
+# Bad: Correlated subquery per entity
+spark.sql("SELECT * FROM orders o1 WHERE order_date = (SELECT MAX(order_date) FROM orders o2 WHERE o2.customer_id = o1.customer_id)").show()
+
+# Good: Single-pass CTE window ranking
+spark.sql("WITH ranked AS (SELECT *, ROW_NUMBER() OVER(PARTITION BY customer_id ORDER BY order_date DESC) as rn FROM orders) SELECT * FROM ranked WHERE rn = 1").show()
+
+```
+
+#### 16. Modularizing Logic via CTEs vs Nested Subqueries
+
+* **Bad:** Deeply nested spaghetti subqueries that confuse the optimizer.
+* **Good:** Clean, reusable Common Table Expressions (`WITH`).
+
+```python
+# Bad: Nested inline subqueries
+spark.sql("SELECT * FROM (SELECT customer_id, SUM(amount) as total FROM orders GROUP BY customer_id) WHERE total > 100").explain()
+
+# Good: Structured CTE pipeline
+spark.sql("WITH totals AS (SELECT customer_id, SUM(amount) as total FROM orders GROUP BY customer_id) SELECT * FROM totals WHERE total > 100").explain()
+
+```
+
+---
+
+### Category 5: Serialization, Caching, & Advanced SQL (Examples 17–20)
+
+#### 17. Avoiding Python UDFs Inside SQL
+
+* **Bad:** Registering custom Python UDFs that break Tungsten whole-stage codegen.
+* **Good:** Using native built-in Spark SQL functions (`SPLIT`, `CONCAT_WS`).
+
+```python
+# Bad: Serializes row-by-row between JVM and Python
+# spark.sql("SELECT my_python_tokenizer(message) FROM logs_a")
+
+# Good: Fully vectorized JVM native execution
+spark.sql("SELECT SPLIT(message, '_')[0] FROM logs_a").show()
+
+```
+
+#### 18. Caching Intermediate Views for Multi-Query Reuse
+
+* **Bad:** Re-scanning base tables across multiple independent queries.
+* **Good:** Caching temporary views or DataFrames once before downstream reuse.
+
+```python
+# Bad: Re-reads and re-computes base table twice
+spark.sql("SELECT customer_id, SUM(amount) FROM orders GROUP BY customer_id").show()
+spark.sql("SELECT customer_id, AVG(amount) FROM orders GROUP BY customer_id").show()
+
+# Good: Cache table in memory/disk once
+spark.sql("CREATE OR REPLACE TEMP VIEW cached_orders AS SELECT * FROM orders")
+spark.sql("CACHE TABLE cached_orders")
+spark.sql("SELECT customer_id, SUM(amount) FROM cached_orders GROUP BY customer_id").show()
+spark.sql("SELECT customer_id, AVG(amount) FROM cached_orders GROUP BY customer_id").show()
+
+```
+
+#### 19. Safe String Concatenation (`CONCAT_WS`)
+
+* **Bad:** Using string addition operators or `||` which return `NULL` if any operand is null.
+* **Good:** Using `CONCAT_WS` to safely ignore null fields.
+
+```python
+# Bad: Returns NULL if any field is null
+spark.sql("SELECT customer_id || ' - ' || order_date FROM orders").show()
+
+# Good: Safely handles nulls and formats separator
+spark.sql("SELECT CONCAT_WS(' - ', customer_id, order_date) FROM orders").show()
+
+```
+
+#### 20. Deterministic Filtering Before Non-Deterministic Sampling
+
+* **Bad:** Placing `rand()` inside join conditions or restrictive predicates, killing filter pushdown.
+* **Good:** Applying joins/filters deterministically first, then projecting random samples.
+
+```python
+# Bad: Non-deterministic predicate blocks optimization
+spark.sql("SELECT * FROM orders WHERE amount > 100 AND rand() > 0.5").explain()
+
+# Good: Deterministic filter first, random sample projection second
+spark.sql("SELECT *, rand() as sample_id FROM orders WHERE amount > 100").explain()
+
+spark.stop()
+print("--- All 20 SQL Optimization Examples Executed Successfully ---")
+
+```
+
+---
+
+Here are two classic, high-impact performance optimization scenarios straight out of enterprise production pipelines. These make fantastic additions to an advanced masterclass curriculum to show students how minor code habits can either crash a cluster or scale smoothly.
+
+---
+
+### Scenario 1: Breaking Partition Pruning with String Functions
+
+#### The Real-World Problem
+
+Imagine you have a multi-terabyte transactions table partitioned on disk by date (`/year=2026/month=10/day=01/`). In a reporting query, a developer writes a filter using a SQL string function:
+
+```sql
+-- THE ANTI-PATTERN: Wrapping partition columns in functions
+SELECT * 
+FROM enterprise_transactions 
+WHERE YEAR(transaction_date) = 2026 AND MONTH(transaction_date) = 10
+
+```
+
+#### Why It Fails
+
+Because you wrapped `transaction_date` inside `YEAR()` and `MONTH()`, Spark **cannot evaluate the file directory paths before scanning**. Catalyst is forced to perform a **Full Table Scan**, reading every single parquet file across all years and months from cloud storage, evaluating the function row-by-row, and discarding non-matching rows. This wastes hours of I/O time and money.
+
+#### The Enterprise Fix
+
+Always use direct, raw column comparisons against your partition keys so the storage reader can prune directories instantly:
+
+```sql
+-- THE OPTIMIZED APPROACH: Direct partition predicate
+SELECT * 
+FROM enterprise_transactions 
+WHERE transaction_date >= '2026-10-01' 
+  AND transaction_date < '2026-11-01'
+
+```
+
+* **Why it works:** Spark evaluates the literal strings against the partition directory structure (`/transaction_date=YYYY-MM-DD/`) and **skips reading 99% of the storage folders entirely** before a single byte hits executor memory.
+
+---
+
+### Scenario 2: Preventing Driver OOMs via Lazy Iteration Traps
+
+#### The Real-World Problem
+
+When validating data quality or writing loops in PySpark, developers often make the mistake of calling actions inside a loop:
+
+```python
+# THE ANTI-PATTERN: Triggering actions inside a loop
+bad_totals = []
+for category in ["Electronics", "Clothing", "Home"]:
+    # .collect() pulls data back to the Driver node immediately!
+    result = spark.sql(f"SELECT sum(amount) FROM sales WHERE category = '{category}'").collect()
+    bad_totals.append(result[0][0])
+
+```
+
+#### Why It Fails
+
+Every time `.collect()` or `.count()` is called inside a loop, Spark stops lazy evaluation, breaks pipeline optimization, spins up separate job stages, and **pulls data across the network back to the Driver node**. If your loop runs over hundreds of distinct IDs or files, you will overwhelm the driver's memory and trigger a fatal **Driver Out-Of-Memory (OOM) Crash**.
+
+#### The Enterprise Fix
+
+Keep transformations lazy, aggregate data in a single distributed pass using `GROUP BY`, and collect **once** at the very end:
+
+```python
+import pyspark.sql.functions as F
+
+# THE OPTIMIZED APPROACH: Single distributed aggregation pass
+optimized_df = spark.sql("""
+    SELECT category, SUM(amount) AS total_revenue 
+    FROM sales 
+    WHERE category IN ('Electronics', 'Clothing', 'Home')
+    GROUP BY category
+""")
+
+# Pull to driver only once for final reporting/logging
+final_results = optimized_df.collect()
+
+```
+
+* **Why it works:** Spark computes all categories concurrently across the cluster in a single distributed stage, minimizing shuffle overhead and keeping driver memory safe.
+
+---
+
+Here are three more high-impact, real-world Spark optimization scenarios that frequently occur in enterprise production data pipelines. These are exceptional additions to your masterclass curriculum to show students how architectural choices directly impact cluster health.
+
+---
+
+### Scenario 3: Accidental Cross Joins (The $M \times N$ Trap)
+
+#### The Real-World Problem
+
+A developer attempts to join two large datasets—say, 1 million customer records and 500,000 transaction records—but forgets the join condition, or writes a non-equi condition incorrectly:
+
+```python
+# THE ANTI-PATTERN: Omitting the join condition or using a bad predicate
+# This forces Spark into a Cartesian Product (every row multiplied by every row)
+bad_joined_df = customers.join(transactions) # Results in 500 BILLION rows!
+
+```
+
+#### Why It Fails
+
+Without a strict equality key, Spark cannot hash or partition the datasets intelligently. It must compare every single row of Table A against every row of Table B. This triggers a massive shuffle, exhausts executor memory, fills up local disk space with shuffle spills, and inevitably crashes the job with an **Out-Of-Memory (OOM)** error.
+
+#### The Enterprise Fix
+
+Always ensure join keys are explicitly defined and verified using `.on()` or SQL `ON` clauses. If you ever *need* to do a cross join intentionally, Spark requires you to explicitly invoke `.crossJoin()` so you acknowledge the computational cost:
+
+```python
+# THE OPTIMIZED APPROACH: Strict equality join condition
+optimized_joined_df = customers.join(
+    transactions, 
+    customers.customer_id == transactions.customer_id, 
+    "inner"
+)
+
+```
+
+---
+
+### Scenario 4: The Small File Problem (Partition Explosion)
+
+#### The Real-World Problem
+
+An automated hourly ingestion pipeline reads massive streams of data, applies aggressive filters, and writes the results back to cloud storage (S3/ADLS/Delta) using default partition settings:
+
+```python
+# THE ANTI-PATTERN: Writing filtered data without adjusting partition counts
+filtered_df = massive_df.filter(massive_df.status == "CRITICAL_ERROR")
+filtered_df.write.format("delta").mode("append").save("/mnt/lake/errors")
+
+```
+
+#### Why It Fails
+
+If `massive_df` had 200 shuffle partitions, but only 0.01% of the rows match `"CRITICAL_ERROR"`, Spark writes thousands of tiny 10KB Parquet files across those 200 partitions every single hour.
+
+* **The Consequences:** Cloud storage APIs get hammered with metadata requests. Later, when a read job tries to open that table, the Driver node spends 20 minutes just listing and parsing millions of tiny file footers before computing a single line of code.
+
+#### The Enterprise Fix
+
+Always coalesce or repartition your DataFrame to match an optimal file size target (typically 128MB to 512MB per file) right before writing to disk:
+
+```python
+# THE OPTIMIZED APPROACH: Coalesce small files before writing
+filtered_df.coalesce(4).write.format("delta").mode("append").save("/mnt/lake/errors")
+
+```
+
+---
+
+### Scenario 5: Conditional Logic—Python UDFs vs. Native `when().otherwise()`
+
+#### The Real-World Problem
+
+A developer needs to categorize transaction amounts into risk tiers (`High`, `Medium`, `Low`) based on numerical thresholds. Familiar with Python, they write a standard UDF:
+
+```python
+import pyspark.sql.functions as F
+from pyspark.sql.types import StringType
+
+# THE ANTI-PATTERN: Python UDF for simple conditional mapping
+@F.udf(returnType=StringType())
+def get_risk_tier(amount):
+    if amount > 10000:
+        return "High"
+    elif amount > 1000:
+        return "Medium"
+    else:
+        return "Low"
+
+bad_df = df.withColumn("risk", get_risk_tier(F.col("amount")))
+
+```
+
+#### Why It Fails
+
+Even though the logic is simple arithmetic, wrapping it in a standard Python UDF forces Spark to serialize every single row out of the JVM, send it over a socket to a Python worker, execute the `if-else` statement row-by-row, and serialize it back. This destroys Tungsten's whole-stage code generation and slows processing down by 10x–50x.
+
+#### The Enterprise Fix
+
+Use native PySpark SQL conditional expressions (`F.when().otherwise()`). They compile directly into JVM bytecode and execute entirely within Catalyst's optimized engine:
+
+```python
+# THE OPTIMIZED APPROACH: Native Spark expression (Zero serialization overhead)
+optimized_df = df.withColumn(
+    "risk",
+    F.when(F.col("amount") > 10000, "High")
+     .when(F.col("amount") > 1000, "Medium")
+     .otherwise("Low")
+)
+
+```
+
+---

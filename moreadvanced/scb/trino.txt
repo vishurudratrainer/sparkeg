@@ -1,0 +1,331 @@
+To run **Trino** and **PySpark** together inside Docker so they can talk to each other, you can use a unified `docker-compose.yml` environment.
+
+This setup spins up a **Trino coordinator server** alongside a **Jupyter PySpark notebook container** that has PySpark pre-installed and configured to query Trino over JDBC.
+
+---
+
+### Step 1: Create the Project Structure
+
+Create a folder for your setup and an inner folder for Trino's catalog configuration:
+
+```bash
+mkdir trino-pyspark-docker && cd trino-pyspark-docker
+mkdir trino-config
+
+```
+
+### Step 2: Create a Sample Catalog File
+
+Inside the `trino-config` folder, create a file named `tpch.properties` to enable Trino's built-in testing dataset:
+
+```properties
+connector.name=tpch
+
+```
+
+### Step 3: Create the `docker-compose.yml` File
+
+Create a `docker-compose.yml` file in your root folder:
+
+```yaml
+version: '3.8'
+
+services:
+  trino:
+    image: trinodb/trino:latest
+    container_name: trino-server
+    ports:
+      - "8080:8080"
+    environment:
+      - JAVA_TOOL_OPTIONS=-Xmx2G
+    volumes:
+      - ./trino-config:/etc/trino/catalog
+    networks:
+      - lakehouse-net
+
+  pyspark:
+    image: jupyter/pyspark-notebook:latest
+    container_name: pyspark-notebook
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    networks:
+      - lakehouse-net
+
+networks:
+  lakehouse-net:
+    driver: bridge
+
+```
+
+---
+
+### Step 4: Start the Stack
+
+Run Docker Compose in detached mode from your terminal:
+
+```bash
+docker compose up -d
+
+```
+
+*(Verification: Run `docker ps` to verify that both `trino-server` and `pyspark-notebook` are running.)*
+
+---
+
+### Step 5: Test the Integration from PySpark
+
+1. Open your browser and navigate to the Jupyter interface:
+```text
+http://localhost:8888
+
+```
+
+
+2. Open a new Python Notebook and execute the following script to connect PySpark to your running Trino container via JDBC:
+
+```python
+from pyspark.sql import SparkSession
+
+# Build Spark session with the Trino JDBC driver loaded
+spark = (
+    SparkSession.builder.appName("TrinoPySparkIntegration")
+    .config(
+        "spark.jars.packages", "io.trino:trino-jdbc:435"
+    )  # Pulls the Trino JDBC driver automatically
+    .getOrCreate()
+)
+
+# Read a sample table from Trino's built-in TPC-H catalog into a PySpark DataFrame
+trino_df = (
+    spark.read.format("jdbc")
+    .option("url", "jdbc:trino://trino:8080/tpch/sf1")
+    .option("dbtable", "nation")
+    .option("user", "admin")
+    .option("driver", "io.trino.jdbc.TrinoDriver")
+    .load()
+)
+
+trino_df.show(5)
+
+```
+
+*Verification:* If successful, PySpark will fetch data across the internal Docker bridge network from the Trino container and print the first 5 rows of the `nation` table directly into your notebook.
+
+
+
+Yes, absolutely! Instead of using real cloud infrastructure (like AWS S3 or Glue), you can run a 100% local, self-contained **Modern Data Lakehouse** stack entirely inside Docker.
+
+To simulate cloud object storage and metadata catalogs locally, we use three lightweight open-source tools:
+
+1. **MinIO:** Acts as a local, S3-compatible object storage server.
+2. **Iceberg REST Catalog:** Manages table metadata locally.
+3. **Trino & PySpark:** The compute engines that write to and query the local data lake.
+
+---
+
+### Step 1: Create Your Project Directory
+
+Create a workspace folder and configuration subfolders:
+
+```bash
+mkdir local-lakehouse-docker && cd local-lakehouse-docker
+mkdir -p trino-catalog
+
+```
+
+### Step 2: Configure Trino's Iceberg Catalog
+
+Create a configuration file telling Trino how to connect to the local MinIO storage and REST catalog.
+
+Create `trino-catalog/iceberg.properties`:
+
+```properties
+connector.name=iceberg
+iceberg.catalog.type=rest
+iceberg.rest-catalog.uri=http://iceberg-rest:8181
+iceberg.rest-catalog.warehouse=s3://warehouse/
+fs.native-s3.enabled=true
+s3.endpoint=http://minio:9000
+s3.path-style-access=true
+s3.aws-access-key=admin
+s3.aws-secret-key=admin123
+s3.region=us-east-1
+
+```
+
+### Step 3: Create the Complete `docker-compose.yml` File
+
+This configuration spins up MinIO (local S3 storage), the Iceberg catalog server, Trino, and a Jupyter PySpark notebook—all connected via an isolated internal Docker network.
+
+Create `docker-compose.yml`:
+
+```yaml
+version: '3.9'
+
+services:
+  minio:
+    image: minio/minio
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: admin123
+    networks:
+      - lakehouse-net
+
+  # Automatically creates the S3 'warehouse' bucket in MinIO on startup
+  create-bucket:
+    image: minio/mc
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set local-minio http://minio:9000 admin admin123) do echo 'Waiting for Minio...' && sleep 1; done;
+      /usr/bin/mc mb local-minio/warehouse --ignore-existing;
+      exit 0;
+      "
+    networks:
+      - lakehouse-net
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    container_name: iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      CATALOG_S3_ACCESS__KEY__ID: admin
+      CATALOG_S3_SECRET__ACCESS__KEY: admin123
+      AWS_REGION: us-east-1
+    depends_on:
+      - minio
+    networks:
+      - lakehouse-net
+
+  trino:
+    image: trinodb/trino:440
+    container_name: trino
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./trino-catalog:/etc/trino/catalog
+    depends_on:
+      - iceberg-rest
+      - minio
+    networks:
+      - lakehouse-net
+
+  pyspark:
+    image: jupyter/pyspark-notebook:latest
+    container_name: pyspark-notebook
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    networks:
+      - lakehouse-net
+
+networks:
+  lakehouse-net:
+    driver: bridge
+
+```
+
+---
+
+### Step 4: Run the Local Stack
+
+Start all components in the background:
+
+```bash
+docker compose up -d
+
+```
+
+*Verification:* Run `docker ps` to verify that all 5 containers (`minio`, `create-bucket`, `iceberg-rest`, `trino`, and `pyspark-notebook`) are up and running.
+
+---
+
+### Step 5: Test the Integration (PySpark writes, Trino reads)
+
+#### 1. PySpark Write Phase
+
+Open your browser to `http://localhost:8888` (Jupyter Notebook), create a new Python notebook, and run this code to process data and write it as an Apache Iceberg table to local MinIO storage:
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp
+
+# Initialize Spark with Iceberg and local MinIO/REST Catalog configs
+spark = (
+    SparkSession.builder.appName("LocalIcebergETL")
+    .config(
+        "spark.jars.packages",
+        "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3,org.apache.iceberg:iceberg-aws-bundle:1.4.3",
+    )
+    .config(
+        "spark.sql.extensions",
+        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+    )
+    .config("spark.sql.catalog.iceberg", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.iceberg.catalog-impl", "org.apache.iceberg.rest.RESTCatalog")
+    .config("spark.sql.catalog.iceberg.uri", "http://iceberg-rest:8181")
+    .config("spark.sql.catalog.iceberg.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    .config("spark.sql.catalog.iceberg.warehouse", "s3://warehouse/")
+    .config("spark.sql.catalog.iceberg.s3.endpoint", "http://minio:9000")
+    .config("spark.sql.catalog.iceberg.s3.path-style-access", "true")
+    .config("spark.sql.catalog.iceberg.s3.aws.access-key-id", "admin")
+    .config("spark.sql.catalog.iceberg.s3.aws.secret-access-key", "admin123")
+    .getOrCreate()
+)
+
+# Create sample local data
+data = [
+    (1, "Alice", "HR", 5000),
+    (2, "Bob", "Engineering", 8000),
+    (3, "Charlie", "Engineering", 7500),
+]
+df = spark.createDataFrame(data, ["id", "name", "department", "salary"])
+
+# Write dataframe to an Iceberg table via the local REST catalog
+df.writeTo("iceberg.default.employees").createOrReplace()
+print("PySpark successfully wrote data to local Iceberg table!")
+
+```
+
+#### 2. Trino Read Phase
+
+Open your terminal and drop directly into the running Trino CLI container:
+
+```bash
+docker exec -it trino trino
+
+```
+
+Once inside the `trino>` SQL shell, query the exact table that PySpark just created:
+
+```sql
+SELECT department, COUNT(*) as headcount, AVG(salary) as avg_salary
+FROM iceberg.default.employees
+GROUP BY department;
+
+```
+
+**Trino Output:**
+
+```text
+ department  | headcount | avg_salary 
+-------------+-----------+------------
+ Engineering |         2 |     7750.0 
+ HR          |         1 |     5000.0 
+(2 rows)
+
+```
