@@ -1,0 +1,69 @@
+
+---
+
+### 1. Shuffle Partitions Formula
+
+To avoid small-file overhead or massive out-of-memory errors during wide transformations, calculate the optimal partition count based on your uncompressed data size:
+
+$$\text{spark.sql.shuffle.partitions} = \frac{\text{Total Uncompressed Shuffle Data Size (in MB)}}{\text{Target Partition Size (typically } 128 \text{ MB)}}$$
+
+* **Rule of Thumb:** Aim for **100 MB to 200 MB** per shuffle partition. For instance, if your query moves $50 \text{ GB}$ ($51,200 \text{ MB}$) of shuffle data, the optimal partition count is:
+
+$$\frac{51,200 \text{ MB}}{128 \text{ MB}} = 400 \text{ partitions}$$
+
+
+
+---
+
+### 2. Auto Broadcast Join Threshold Formula
+
+Broadcasting small tables avoids expensive network shuffles by copying the dataset to all executor nodes. However, setting this too high will crash executors with `OutOfMemoryError`.
+
+The safe maximum threshold per executor core can be estimated by:
+
+$$\text{Auto Broadcast Threshold} \le \frac{\text{Executor Heap Memory} \times \text{Safety Fraction}}{\text{Number of Cores per Executor}}$$
+
+* **Rule of Thumb:** A safety fraction of **$0.05$ to $0.10$** (5% to 10% of total executor memory) ensures the broadcast copy doesn't starve execution memory.
+* *Example:* For a 16 GB executor, a safe maximum threshold is roughly $16 \text{ GB} \times 0.05 \approx 800 \text{ MB}$ (expressed in bytes as `838860800`).
+
+---
+
+### 3. Spark Memory Management Formula
+
+Spark divides the JVM heap space into reserved memory, user memory, and unified memory (which splits dynamically between execution and storage).
+
+$$\text{Usable Spark Memory} = \text{spark.memory.fraction} \times (\text{JVM Heap Size} - 300 \text{ MB})$$
+
+Within that unified memory pool:
+
+* **Execution Memory** (used for shuffles, joins, and aggregations):
+
+$$\text{Max Execution Pool} = (1 - \text{spark.memory.storageFraction}) \times \text{Usable Spark Memory}$$
+
+
+* **Storage Memory** (used for caching and broadcasts):
+
+$$\text{Max Storage Pool} = \text{spark.memory.storageFraction} \times \text{Usable Spark Memory}$$
+
+
+* *Defaults:* `spark.memory.fraction = 0.6` (60% of heap) and `spark.memory.storageFraction = 0.5` (half of that for storage, half for execution).
+
+---
+
+### 4. Executor Memory Overhead Formula
+
+Non-JVM memory (such as off-heap buffers, Python worker processes for PySpark, and container administrative overhead) requires dedicated buffer space outside the Spark JVM heap to prevent YARN or Kubernetes from killing the container:
+
+$$\text{spark.executor.memoryOverhead} = \max \left( 384 \text{ MB}, \, 0.07 \times \text{spark.executor.memory} \right)$$
+
+* **Rule of Thumb:** If you run heavy PySpark workflows or use window functions/UDFs extensively, scale this up to **$0.15 \times \text{spark.executor.memory}$** or higher.
+
+---
+
+### 5. Cluster Concurrency / Parallelism Formula
+
+To fully saturate your cluster resources without queueing tasks, your total task parallelism should align with your total available core capacity:
+
+$$\text{Total Concurrent Tasks} = \text{Number of Executors} \times \text{Cores per Executor}$$
+
+* **Rule of Thumb:** For optimal pipeline efficiency, ensure your total shuffle partitions or RDD partitions are roughly **$2 \times$ to $3 \times$** your total concurrent task capacity so that cores remain busy processing subsequent task queues instantly.
